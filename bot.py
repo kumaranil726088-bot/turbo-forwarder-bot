@@ -2070,6 +2070,24 @@ async def poll_loop():
             interval = 8
         await asyncio.sleep(interval)
 
+async def keepalive_loop():
+    """Render free instance ko sleep hone se bachane ke liye har 10 min health ping."""
+    base_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+    if not base_url:
+        return
+    ping_url = f"{base_url}/health"
+    log.info("⚡ Keep-alive active: %s", ping_url)
+    while True:
+        await asyncio.sleep(600)
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(ping_url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                    log.info("Keep-alive ping %s -> %s", ping_url, r.status)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.warning("Keep-alive warn: %s", e)
+
 # ------------------------------------------------------------------ #
 #  HTTP HEALTH SERVER                                                 #
 # ------------------------------------------------------------------ #
@@ -2139,6 +2157,7 @@ async def main():
             log.warning("User session restore fail: %s", e)
 
     client.loop.create_task(poll_loop())
+    client.loop.create_task(keepalive_loop())
 
     # 🔄 AUTO-RESUME pending task (restart ke baad wahi se continue)
     pend = load_pending()
