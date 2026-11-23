@@ -1299,7 +1299,7 @@ async def callbacks(e):
     if data == 'admin_access':
         if uid != OWNER_ID:
             raise ValueError('Owner only')
-        return await admin(e,'access','whitelist' if DB.global_get('access','open')=='open' else 'open')
+        return await control_ui.ask(sys.modules[__name__],e,'whitelist' if DB.global_get('access','open')=='open' else 'open')
     raise ValueError('This button is from an old version. Use /start for the current menu.')
 
 

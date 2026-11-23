@@ -78,6 +78,11 @@ class UIIntegrationTests(unittest.IsolatedAsyncioTestCase):
         token=next(iter(ui.CONFIRM));ui.CONFIRM[token]['expires']=0
         with self.assertRaises(ValueError):await ui.apply(self.module(),Event(),token)
         self.assertTrue(bot.DB.allowed(2))
+    async def test_legacy_access_button_also_requires_confirmation(self):
+        await bot.callbacks(self.event('admin_access'))
+        self.assertEqual(bot.DB.global_get('access','open'),'open')
+        self.assertEqual(len(ui.CONFIRM),1)
+
     async def test_navigation_cancels_old_confirmation(self):
         await ui.ask(self.module(),Event(),'ban',2)
         token=next(iter(ui.CONFIRM))

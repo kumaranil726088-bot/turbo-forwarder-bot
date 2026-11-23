@@ -15,7 +15,7 @@ Telegram bot: **@TurboForwarderPro_Bot**. Open access is the default: `OWNER_ID`
 - `/reconnect` lets each user reconnect **only their own** restored saved session without a fresh OTP where Telegram still accepts it. Otherwise use `/login`.
 - Backup is owner-triggered/manual, **not scheduled or an external database**. Save a backup before deploys. Free Render sleep and ephemeral filesystem limits still apply. Creating a website cannot remove hosting/storage quotas. An external DB needs separately supplied account/connection credentials; none was provisioned by this change.
 
-Testing: `python -m unittest test_v6 test_ui -v` runs 64 offline unit/mocked-integration tests. These do not certify end-to-end private/restricted-channel transfers or Telegram permissions. V6 live transport verification is documented separately in the workspace research notes.
+Testing: `python -m unittest test_v6 test_ui -v` runs 65 offline unit/mocked-integration tests. These do not certify end-to-end private/restricted-channel transfers or Telegram permissions. V6 live transport verification is documented separately in the workspace research notes.
 
 ## Architecture
 
