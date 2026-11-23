@@ -1,0 +1,4 @@
+telethon>=1.37
+cryptg>=0.5
+aiohttp>=3.9
+python-dotenv>=1.0
