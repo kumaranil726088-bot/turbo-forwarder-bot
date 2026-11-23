@@ -49,7 +49,7 @@ class Store:
             self.db.execute('VACUUM')
         self.global_set('migration_v6', True)
     def touch(self, uid, name='', username=''):
-        self.db.execute('INSERT INTO users(uid,name,username,joined_at,role) VALUES(?,?,?,?,?) ON CONFLICT(uid) DO UPDATE SET name=excluded.name,username=excluded.username',
+        self.db.execute('INSERT INTO users(uid,name,username,joined_at,role) VALUES(?,?,?,?,?) ON CONFLICT(uid) DO UPDATE SET name=excluded.name,username=excluded.username WHERE users.name<>excluded.name OR users.username<>excluded.username',
                         (uid,name,username,time.time(),'owner' if uid == self.owner else 'user'))
         self.db.commit()
     def allowed(self, uid):
@@ -73,7 +73,7 @@ class Store:
             if not self.cipher:
                 raise RuntimeError('Set SESSION_KEY before storing logins')
             value = self.cipher.encrypt(value.encode()).decode()
-        self.db.execute('INSERT INTO user_settings VALUES(?,?,?) ON CONFLICT(uid,key) DO UPDATE SET value=excluded.value',(uid,key,json.dumps(value)))
+        self.db.execute('INSERT INTO user_settings VALUES(?,?,?) ON CONFLICT(uid,key) DO UPDATE SET value=excluded.value WHERE user_settings.value<>excluded.value',(uid,key,json.dumps(value)))
         self.db.commit()
     def global_get(self, key, default=None):
         row = self.db.execute('SELECT value FROM global_settings WHERE key=?',(key,)).fetchone()

@@ -28,12 +28,13 @@ async def home(b,e):
           f'👥 Registered users: {len(users)}\n🚫 Banned users: {sum(bool(r[3]) for r in users)}\n'
           f'🔐 Connected sessions: {len(b.USER_CLIENTS)} / {b.MAX_SESSIONS}\n\n'
           f'⚡ Running jobs: {len(b.JOBS)}\n🔴 Live routes: {len(routes)}\n⏸ Paused routes: {sum(bool(r.get("paused")) for r in routes)}\n\n'
-          f'🚪 Access mode: {b.DB.global_get("access","open").upper()}\n💾 Storage: {"persistent (operator configured)" if b.os.getenv("PERSISTENT_STORAGE")=="1" else "ephemeral — backup recommended"}\n\n'
+          f'🚪 Access mode: {b.DB.global_get("access","open").upper()}\n💾 Storage: {b.storage_status()}\n\n'
           'Select a section below. Destructive actions require confirmation.\n\n'
           '🔒 Account credentials/OTP/session strings are not exposed here.')
     buttons=[[kb('👥 Manage users','adm_users_0'),kb('🔎 Find user ID','adm_find')],
              [kb('⚡ Jobs','adm_jobs_0'),kb('🔴 Live routes','adm_routes_0')],
              [kb('🚪 Access control','adm_access'),kb('📣 Broadcast','adm_broadcast')],
+             [kb('🔐 Session health','adm_sessions_0'),kb('☁ Storage health','adm_storage')],
              [kb('💾 Encrypted backup','adm_backup'),kb('♻ Restore guide','adm_restore')],
              [kb('📖 Owner guide','help_admin'),kb('↻ Refresh','adm_home')]]
     return await b.respond(e,text,buttons)
@@ -58,7 +59,7 @@ async def detail(b,e,uid):
     _,name,username,banned,role,total=user_row(b,uid)
     job=b.JOBS.get(uid);routes=b.DB.get(uid,'watch',[])
     text=(f'👤 USER DETAILS\n━━━━━━━━━━━━━━━━━━━━\n\nID: {uid}\nName: {str(name)[:80]}\nUsername: @{username or "—"}\n\n'
-          f'Role: {role}\nBanned: {bool(banned)}\nAccess now: {b.DB.allowed(uid)}\nConnected: {uid in b.USER_CLIENTS}\n\n'
+          f'Role: {role}\nBanned: {bool(banned)}\nAccess now: {b.DB.allowed(uid)}\nConnected: {uid in b.USER_CLIENTS}\nSession health: {b.RECOVERY.status(uid)["state"] if b.RECOVERY else "not monitored"}\n\n'
           f'Messages sent: {total}\nJob: {str(job["done"])+"/"+str(job["total"]) if job else "Idle"}\n'
           f'Resume checkpoint: {bool(b.DB.get(uid,"pending_job"))}\nRoutes: {len(routes)}\n\n'
           'Moderation affects this bot only, not the user’s Telegram account.')
@@ -66,6 +67,8 @@ async def detail(b,e,uid):
     if uid!=b.OWNER_ID:
         buttons.append([kb('Unban' if banned else 'Ban',f'adm_ask_{"unban" if banned else "ban"}_{uid}'),kb('Approve whitelist',f'adm_ask_approve_{uid}')])
         if role=='approved':buttons.append([kb('Revoke whitelist approval',f'adm_ask_revoke_{uid}')])
+    if b.DB.get(uid,'session') and b.DB.allowed(uid):
+        buttons.append([kb('🔄 Retry saved connection',f'adm_ask_retrylogin_{uid}')])
     if job:buttons.append([kb('⏹ Stop transfer',f'adm_ask_stop_{uid}')])
     if routes:buttons.append([kb('⏸ Pause all routes',f'adm_ask_pause_{uid}'),kb('▶ Resume routes',f'adm_ask_resume_{uid}')])
     buttons.extend([[kb('↻ Refresh',f'adm_user_{uid}'),kb('👥 Users','adm_users_0')],[kb('👑 Dashboard','adm_home')]])
@@ -106,6 +109,7 @@ async def ask(b,e,action,uid=None,rid=None,payload=None):
     CONFIRM.clear()  # one pending owner action; old buttons cannot trigger a changed request
     CONFIRM[token]=dict(action=action,uid=uid,rid=rid,payload=payload,expires=time.time()+180)
     descriptions={
+      'retrylogin':'Retry the existing saved session connection. No OTP/password is requested or revealed, and no arbitrary account action is performed.',
       'ban':'Block this user and stop their active transfers. Disconnect session without revoking their Telegram account.',
       'unban':'Remove this bot ban. Whitelist approval remains separate.',
       'approve':'Approve this user for whitelist access.',
@@ -129,11 +133,14 @@ async def pause_routes(b,uid,paused,rid=None,delete=False):
     routes=b.DB.get(uid,'watch',[])
     selected=[r for r in routes if rid is None or r['id']==rid]
     if not selected:raise ValueError('Route no longer exists')
+    if not paused and any(r.get('flood_until',0)>time.time() for r in selected):
+        raise ValueError('Telegram FloodWait is still active; retry after the required wait')
     for r in selected:
         task=b.WATCH_TASKS.get((uid,r['id']))
         if task:
             task.cancel();await asyncio.gather(task,return_exceptions=True)
         r['paused']=paused
+        if not paused:r['retry_at']=0
     b.DB.set(uid,'watch',[r for r in routes if r not in selected] if delete else routes)
     if not paused and not delete:
         for r in selected:b.kick_watch(uid,r['id'])
@@ -152,6 +159,9 @@ async def apply(b,e,token):
         b.DB.flag(uid,'role','user')
         if not b.DB.allowed(uid):
             await b.disconnect_user(uid);await b.close_login(uid)
+    elif action=='retrylogin':
+        if not b.DB.allowed(uid):raise ValueError('User access is disabled')
+        await b.ensure_session(uid,force=True)
     elif action=='stop':await b.stop_job(uid)
     elif action in ('pause','resume','pauseroute','playroute','delroute'):
         if action in ('resume','playroute') and (not b.DB.allowed(uid) or uid not in b.USER_CLIENTS):
@@ -171,6 +181,8 @@ async def apply(b,e,token):
         for u in list(b.LOGINS):await b.close_login(u)
         b.PANELS.clear()
         b.DB.restore_snapshot(payload['data'],b.OWNER_ID)
+        if b.RECOVERY:b.RECOVERY.state.clear()
+        await b.durable_flush(critical=True)
         return await b.respond(e,'✅ Backup restored. Runtime sessions disconnected safely. Users: /reconnect to use their restored saved session (or /login if expired); saved checkpoints/routes are restored. /admin',[[kb('👑 Dashboard','adm_home')]])
     else:raise ValueError('Unknown admin action')
     if uid is not None:
@@ -214,6 +226,26 @@ async def callback(b,e,data):
     require(b,e)
     parts=data.split('_');action=parts[1]
     if action=='home':return await home(b,e)
+    if action=='storage':
+        return await b.respond(e,'☁ ENCRYPTED STORAGE HEALTH\n━━━━━━━━━━━━━━━━━━━━\n\n'+b.storage_status()+'\n\nLogin/import/logout changes request immediate sync. Routine settings/routes/checkpoints sync periodically; they can lag after a sudden crash. Remote outage or writer conflict is shown here, not treated as permanent login loss.\n\nManual /backup remains a fallback. GitHub quotas apply; this is not an unlimited database.',[[kb('Sync checkpoint now','adm_sync'),kb('💾 Backup','adm_backup')],[kb('👑 Dashboard','adm_home')]])
+    if action=='sync':
+        ok=await b.durable_flush(critical=True)
+        return await b.respond(e,('✅ Sync request completed. ' if ok else '⚠ Sync failed. ')+b.storage_status(),[[kb('Storage health','adm_storage'),kb('👑 Dashboard','adm_home')]])
+    if action=='sessions':
+        rows=[r for r in b.DB.users() if b.DB.get(r[0],'session')]
+        page=max(0,min(int(parts[2]),max(0,(len(rows)-1)//6)))
+        text=f'🔐 SAVED SESSION HEALTH\n\nPage {page+1} • {len(rows)} saved logins\n\n'
+        buttons=[]
+        for uid,*_ in rows[page*6:(page+1)*6]:
+            state=b.RECOVERY.status(uid) if b.RECOVERY else {'state':'not monitored','error':''}
+            text+=f'{uid}: {state["state"]}\nLast issue: {state.get("error") or "None"}\n\n'
+            buttons.append([kb(f'Manage {uid}',f'adm_user_{uid}')])
+        nav=[]
+        if page:nav.append(kb('← Previous',f'adm_sessions_{page-1}'))
+        if (page+1)*6<len(rows):nav.append(kb('Next →',f'adm_sessions_{page+1}'))
+        if nav:buttons.append(nav)
+        buttons.append([kb('👑 Dashboard','adm_home')])
+        return await b.respond(e,text,buttons)
     if action=='users':return await users(b,e,int(parts[2]))
     if action=='user':return await detail(b,e,int(parts[2]))
     if action in ('jobs','routes'):return await listing(b,e,action,int(parts[2]))

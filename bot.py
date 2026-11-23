@@ -1,4 +1,4 @@
-"""Turbo Forwarder V6.0 — isolated users, event-driven routes, bounded transfers.
+"""Turbo Forwarder V6.2 — saved-session recovery and resilient private watches.
 Use only for content you are authorized to copy. Telegram permissions still apply.
 """
 import asyncio
@@ -30,14 +30,17 @@ from telethon.tl.types import BotCommand, BotCommandScopeDefault, BotCommandScop
 from telethon.errors import SessionPasswordNeededError, FloodWaitError
 
 import control_ui
+from media_io import download_original
 from help_ui import help_page, SLASH_MENU, OWNER_MENU
+from remote_state import GitState, Checkpoints, StateConflict
+from sessions import SessionRecovery, LoginRequired, SessionUnavailable, AUTH_ERRORS
 from storage import Store, DEFAULTS
 from transfer import Parallel, TYPES, parse_links, parse_post_link, source_ref, destination, msg_type, topic_id, renamed, retry
 
 from dotenv import load_dotenv
 load_dotenv()
 
-VERSION = '6.1'
+VERSION = '6.2'
 START = time.time()
 API_ID = int(os.getenv('API_ID','0'))
 API_HASH = os.getenv('API_HASH','')
@@ -52,6 +55,7 @@ logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(name)
 log = logging.getLogger('turbo')
 # Do not log credentials or message contents.
 logging.getLogger('telethon').setLevel(logging.WARNING)
+logging.getLogger('asyncio').setLevel(logging.WARNING)
 BOT = None
 DB = None
 USER_CLIENTS = {}
@@ -64,6 +68,10 @@ BACKGROUND = set()
 TRANSFER_LIMIT = None
 USERNAME = ''
 STOPPING = False
+CHECKPOINTS = None
+RECOVERY = None
+SUPPORT_URL = 'https://t.me/SyntaxError_2'
+SYNC_WARNING_AT = 0
 
 
 def spawn(coro):
@@ -129,11 +137,51 @@ async def entity(cl,ref):
         return await retry(cl.get_entity,value)
 
 
-async def fetcher(uid,src):
+def support_buttons():
+    return [[Button.url('🆘 Contact @SyntaxError_2',SUPPORT_URL),Button.inline('📖 Help',b'help_home')]]
+
+
+async def ensure_session(uid,optional=False,force=False):
+    if RECOVERY:
+        return await RECOVERY.ensure(uid,optional=optional,force=force)
+    # Tests and local deployments can inject a registry without creating a manager.
     if uid in USER_CLIENTS:
         return USER_CLIENTS[uid]
+    saved=DB.get(uid,'session')
+    if saved:
+        return await connect_user(uid,saved)
+    if optional:
+        return None
+    raise LoginRequired('Connect your own Telegram account once with /login.')
+
+
+def storage_status():
+    if not CHECKPOINTS:
+        return 'local persistent disk' if os.getenv('PERSISTENT_STORAGE')=='1' else 'ephemeral (no remote checkpoints configured)'
+    remote=CHECKPOINTS.remote
+    age=int(time.time()-remote.last_success) if remote.last_success else None
+    return ('⚠ '+remote.error if remote.error else 'Encrypted remote checkpoint OK')+f' | last sync: {age}s ago'
+
+
+async def durable_flush(critical=False):
+    global SYNC_WARNING_AT
+    if not CHECKPOINTS:return True
+    try:
+        await CHECKPOINTS.flush()
+        return True
+    except Exception as exc:
+        log.error('Encrypted state sync failed: %s',type(exc).__name__)
+        if time.time()-SYNC_WARNING_AT>600:
+            SYNC_WARNING_AT=time.time()
+            await notify(OWNER_ID,'⚠ Durable state sync failed: '+type(exc).__name__+'. Local service continues, but new changes are NOT yet safe across restart. /admin → Storage. Check GitHub/key/network. No saved sessions were deleted.',buttons=support_buttons())
+        return False
+
+
+async def fetcher(uid,src):
+    if uid in USER_CLIENTS or DB.get(uid,'session'):
+        return await ensure_session(uid)
     if str(src).lstrip('-').isdigit():
-        raise ValueError('Private sources require your own /login and channel membership')
+        raise LoginRequired('Private sources require your own saved account and channel membership. /login once.')
     ent = await entity(BOT,src)
     if not isinstance(ent,Channel) or not getattr(ent,'username',None):
         raise ValueError('Without login, sources must be public channels/supergroups, never bot private conversations')
@@ -143,14 +191,10 @@ async def fetcher(uid,src):
 async def destination_entity(uid,cfg):
     ref,topic = destination(cfg.get('target') or str(uid))
     topic = int(cfg.get('topic') or topic or 0) or None
-    sender = USER_CLIENTS.get(uid) if cfg.get('sender') == 'User' else BOT
-    if not sender:
-        raise ValueError('Sender User requires /login')
+    sender = await ensure_session(uid) if cfg.get('sender') == 'User' else BOT
     # Shared bot admin rights must never grant an unrelated user access to a chat.
     if ref != str(uid):
-        own = USER_CLIENTS.get(uid)
-        if not own:
-            raise ValueError('For channel/group destinations, /login to verify your access first')
+        own = await ensure_session(uid)
         own_ent = await entity(own,ref)
         rights = await retry(own.get_permissions,own_ent,'me')
         if getattr(own_ent,'broadcast',False) and not (getattr(rights,'is_admin',False) or getattr(rights,'is_creator',False)):
@@ -219,19 +263,21 @@ async def prepare(uid,src,mid,cfg,index,folder,seen):
     group = await messages_group(cl,source,mid)
     if not group:
         return {'skip':True,'ids':[mid]}
+    all_ids=[m.id for m in group]
     key = (str(src), group[0].grouped_id or group[0].id)
     if key in seen:
-        return {'skip':True,'ids':[mid]}
+        return {'skip':True,'ids':all_ids}
     seen.add(key)
-    group = [m for m in group if msg_type(m) in cfg['type_filters'] and (cfg['filter'] != 'text' or msg_type(m) == 'text')]
+    delivered=set(cfg.get('_delivered_ids',[]))
+    group = [m for m in group if m.id not in delivered and msg_type(m) in cfg['type_filters'] and (cfg['filter'] != 'text' or msg_type(m) == 'text')]
     if not group:
-        return {'skip':True,'ids':[mid]}
+        return {'skip':True,'ids':all_ids}
     changed_file = bool(cfg.get('rename') or cfg.get('thumb'))
     restricted = getattr(source,'noforwards',False) or any(getattr(m,'noforwards',False) for m in group)
     # Files are copied with their original session, not a cross-account access hash.
     sender = USER_CLIENTS.get(uid) if cfg.get('sender') == 'User' else BOT
     direct = cl is sender and not restricted and not changed_file and cfg['mode'] != 'download'
-    result = dict(cl=cl,source=source,src_ref=src,msgs=group,files=[],thumbs=[],direct=direct,ids=[m.id for m in group],index=index)
+    result = dict(cl=cl,source=source,src_ref=src,msgs=group,files=[],thumbs=[],direct=direct,ids=all_ids,index=index)
     if direct or not any(m.file for m in group):
         return result
     folder.mkdir(parents=True,exist_ok=True)
@@ -248,22 +294,14 @@ async def prepare(uid,src,mid,cfg,index,folder,seen):
             media_dir = folder/str(m.id)
             media_dir.mkdir(exist_ok=True)
             path = media_dir/renamed(name,cfg.get('rename',''),index)
-            try:
-                if size < 1024*1024:
-                    raise ValueError('Small file: standard path')
-                await Parallel(cl,cfg['connections']).download(m,str(path))
-            except (asyncio.CancelledError,FloodWaitError):
-                raise
-            except Exception as exc:
-                log.info('Standard download fallback: %s',type(exc).__name__)
-                await retry(cl.download_media,m,file=str(path))
-            if not path.exists() or (size and path.stat().st_size != size):
-                raise IOError('Incomplete media download')
+            await download_original(cl,m,path,cfg['connections'])
             thumb = None
             if cfg.get('thumb'):
                 candidate = ROOT/f'u_{uid}'/'thumb.jpg'
                 if candidate.is_file():
                     thumb = str(candidate)
+                else:
+                    log.info('Custom thumbnail unavailable for uid=%s; using source thumbnail',uid)
             if not thumb and (m.video or m.document):
                 try:
                     thumb = await retry(cl.download_media,m,file=str(folder/f'{m.id}_thumb.jpg'),thumb=-1)
@@ -365,6 +403,7 @@ async def run_job(uid,links,cfg=None,start=0,topic_map=None):
     pending_tasks = {}
     seen = set()
     try:
+        await durable_flush(critical=True)
         sender,dest,default_topic = await destination_entity(uid,cfg)
         workers = max(1,min(5,int(cfg['workers'])))
         async with lock(uid):
@@ -400,6 +439,8 @@ async def run_job(uid,links,cfg=None,start=0,topic_map=None):
     except asyncio.CancelledError:
         job['state'] = 'Stopped; /resume available'
     except Exception as exc:
+        if RECOVERY and isinstance(exc,AUTH_ERRORS+(LoginRequired,)):
+            RECOVERY.state[uid]={'state':'revoked','error':type(exc).__name__}
         job['state'] = 'Failed: '+type(exc).__name__
         await notify(uid,'Transfer paused: '+str(exc)[:400]+'\nFix settings, then /resume. Telegram permissions still apply.')
     finally:
@@ -460,13 +501,20 @@ async def connect_user(uid,session):
     try:
         await cl.connect()
         if not await cl.is_user_authorized():
-            raise ValueError('Session expired; /login again')
+            raise LoginRequired('Telegram session expired/revoked; /login again')
         me = await cl.get_me()
         if me.id != uid:
             raise ValueError('Session must belong to the Telegram account messaging this bot')
-        await cl.get_dialogs(limit=None)
-        await disconnect_user(uid,revoke=False)
+        # Entity warming is optional; a transient dialog failure must not discard a valid login.
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(cl.get_dialogs(limit=200),30)
+        if uid not in USER_CLIENTS and len(USER_CLIENTS)>=MAX_SESSIONS:
+            raise SessionUnavailable('Saved login retained; concurrent session capacity is currently full')
+        previous=USER_CLIENTS.get(uid)
         USER_CLIENTS[uid] = cl
+        if previous and previous is not cl:
+            with contextlib.suppress(Exception):
+                await previous.disconnect()
         async def on_new(event):
             if STOPPING or not DB.allowed(uid):
                 return
@@ -476,7 +524,10 @@ async def connect_user(uid,session):
         cl.add_event_handler(on_new,events.NewMessage(incoming=True))
         # Outgoing messages in watched channels also count (loop destinations are rejected).
         cl.add_event_handler(on_new,events.NewMessage(outgoing=True))
-        DB.set(uid,'session',cl.session.save())
+        saved=cl.session.save()
+        if DB.get(uid,'session')!=saved:
+            DB.set(uid,'session',saved)
+        if RECOVERY:RECOVERY.connected(uid)
         return cl
     except BaseException:
         if USER_CLIENTS.get(uid) is not cl:
@@ -498,7 +549,10 @@ async def disconnect_user(uid,revoke=False):
         await cl.disconnect()
 
 
-def kick_watch(uid,rid):
+def kick_watch(uid,rid,force=False):
+    route=next((r for r in DB.get(uid,'watch',[]) if r.get('id')==rid),None)
+    if not route or route.get('paused') or route.get('flood_until',0)>time.time():return
+    if not force and route.get('retry_at',0)>time.time():return
     key = (uid,rid)
     if key not in WATCH_TASKS or WATCH_TASKS[key].done():
         WATCH_TASKS[key] = spawn(drain_watch(uid,rid))
@@ -523,9 +577,7 @@ async def drain_watch(uid,rid):
             route = next((r for r in routes if r['id']==rid),None)
             if not route or route.get('paused') or not DB.allowed(uid):
                 return
-            cl = USER_CLIENTS.get(uid)
-            if not cl:
-                return
+            cl = await ensure_session(uid)
             cfg = cfg_for(uid)
             cfg['target'] = route['target']
             cfg['topic'] = route.get('topic')
@@ -538,11 +590,20 @@ async def drain_watch(uid,rid):
                     break
                 if m.id <= route.get('last',0):
                     continue
+                recent=route.get('recent_ids',[])
+                if m.id in recent:
+                    route['last']=m.id
+                    save_route(uid,route)
+                    continue
+                cfg['_delivered_ids']=recent
                 item = await prepare(uid,route['src'],m.id,cfg,m.id,folder/str(m.id),seen)
                 n = await send_prepared(uid,item,cfg,sender,dest,topic)
                 DB.success(uid,n)
-                route['last'] = max(item.get('ids',[m.id]))
+                # Advance through the iterator, not max(album IDs): interleaved posts must not be skipped.
+                route['last'] = m.id
+                route['recent_ids']=list(dict.fromkeys(recent+item.get('ids',[m.id])))[-200:]
                 route['error'] = ''
+                route.update(failures=0,retry_at=0,flood_until=0,last_success=time.time())
                 if not save_route(uid,route):
                     break
                 shutil.rmtree(folder,ignore_errors=True)
@@ -550,14 +611,24 @@ async def drain_watch(uid,rid):
     except asyncio.CancelledError:
         raise
     except Exception as exc:
+        if RECOVERY and isinstance(exc,AUTH_ERRORS+(LoginRequired,)):
+            RECOVERY.state[uid]={'state':'revoked','error':type(exc).__name__}
         routes = DB.get(uid,'watch',[])
         route = next((r for r in routes if r['id']==rid),None)
         if route:
             old = route.get('error')
             route['error'] = type(exc).__name__+': '+str(exc)[:200]
+            failures=route.get('failures',0)+1
+            delay=min(900,5*2**min(failures,8))
+            if isinstance(exc,FloodWaitError):
+                delay=max(delay,exc.seconds+1)
+                route['flood_until']=time.time()+exc.seconds+1
+            route.update(failures=failures,retry_at=time.time()+delay)
+            should_notify=old!=route['error'] and time.time()-route.get('notice_at',0)>300
+            if should_notify:route['notice_at']=time.time()
             save_route(uid,route)
-            if old != route['error']:
-                await notify(uid,f"Watch {rid} waiting: {route['error']}\n/watchlist to inspect. Cursor was NOT skipped.")
+            if should_notify:
+                await notify(uid,f"Watch {rid} waiting: {route['error']}\nAutomatic retry in {delay}s. Cursor was NOT skipped.\n/watchlist to inspect. Support: @SyntaxError_2",buttons=support_buttons())
     finally:
         shutil.rmtree(folder,ignore_errors=True)
         WATCH_TASKS.pop((uid,rid),None)
@@ -579,8 +650,7 @@ async def poll_loop():
 
 
 async def add_watch(uid,raw):
-    if uid not in USER_CLIENTS:
-        raise ValueError('/login first for event-driven automatic forwarding')
+    await ensure_session(uid)
     parts = raw.split()
     if not parts:
         raise ValueError('/watch <source or post link> [destination[:topic]]')
@@ -622,7 +692,8 @@ async def add_watch(uid,raw):
 def menu():
     return [[Button.inline('🔐 My login',b'menu_login'),Button.inline('⚡ Forward',b'menu_forward')],
             [Button.inline('🔴 Auto-Forward',b'menu_watch'),Button.inline('⚙ My settings',b'menu_settings')],
-            [Button.inline('📊 My status',b'menu_status'),Button.inline('❓ Commands',b'menu_help')]]
+            [Button.inline('📊 My status',b'menu_status'),Button.inline('❓ Commands',b'menu_help')],
+            [Button.url('🆘 Support • @SyntaxError_2',SUPPORT_URL)]]
 
 HELP = help_page('home')[0]  # compatibility for tooling; command pages are served dynamically
 
@@ -720,11 +791,20 @@ async def close_login(uid):
 
 
 async def start_login(e):
+    uid=e.sender_id
+    if uid in USER_CLIENTS or DB.get(uid,'session'):
+        try:
+            await ensure_session(uid,force=True)
+            await respond(e,'✅ You are already logged in. Your saved account is connected—no new OTP needed.',menu())
+            return False
+        except LoginRequired:
+            pass
     if not DB.cipher:
         raise ValueError('Owner must configure SESSION_KEY before logins')
     await close_login(e.sender_id)
     LOGINS[e.sender_id] = dict(step='phone',created=time.time())
     await respond(e,'🔐 Your private login\nSend your phone with country code (+91…).\nUse the inline keypad for OTP; never send the plain OTP as a chat message.\nYour session is encrypted at rest. Bot operator can access server-side sessions; only log in if you trust this deployment. /cancellogin')
+    return True
 
 
 async def finish_login(e,state):
@@ -736,7 +816,8 @@ async def finish_login(e,state):
     session = cl.session.save()
     await close_login(uid)
     await connect_user(uid,session)
-    await respond(e,'✅ Your account is connected and isolated. /setchannel or /watch to continue.',menu())
+    synced=await durable_flush(critical=True)
+    await respond(e,'✅ Your account is connected. '+('Encrypted remote recovery checkpoint saved.' if CHECKPOINTS and synced else '⚠ Remote recovery pending/unconfigured; do not restart before storage is healthy.')+'\n/setchannel or /watch to continue.',menu())
 
 
 async def login_input(e):
@@ -803,7 +884,7 @@ async def watch_view(e,page=0):
     buttons = []
     for r in routes[page*5:(page+1)*5]:
         text += f"\n{'⏸ PAUSED' if r.get('paused') else '🟢 ACTIVE'} • {r['id']}\n\nSource: {r['src']}\nDestination: {r['target']}\nLast confirmed ID: {r.get('last')}\nStatus: {r.get('error') or 'OK'}\n━━━━━━━━━━━━━━━━━━━━\n"
-        buttons.append([Button.inline('Resume' if r.get('paused') else 'Pause',('watch_toggle_'+r['id']).encode()),Button.inline('Delete '+r['id'],('watch_del_'+r['id']).encode())])
+        buttons.append([Button.inline('Resume' if r.get('paused') else 'Pause',('watch_toggle_'+r['id']).encode()),Button.inline('Retry now',('watch_retry_'+r['id']).encode()),Button.inline('Delete '+r['id'],('watch_del_'+r['id']).encode())])
     nav=[]
     if page:nav.append(Button.inline('← Previous',f'watchpage_{page-1}'.encode()))
     if (page+1)*5<len(routes):nav.append(Button.inline('Next →',f'watchpage_{page+1}'.encode()))
@@ -876,16 +957,20 @@ async def command(e,cmd,arg):
     uid = e.sender_id
     if cmd in ('start','help'):
         text,buttons = help_page(arg or 'home',owner=uid==OWNER_ID)
-        if os.getenv('PERSISTENT_STORAGE')!='1' and (arg or 'home')=='home':
+        if not CHECKPOINTS and os.getenv('PERSISTENT_STORAGE')!='1' and (arg or 'home')=='home':
             text += '\n\n💾 Free hosting: restart/redeploy may erase local state. Owner: /backup before changes; /help tools for recovery details.'
+        if CHECKPOINTS and (arg or 'home')=='home':
+            text += '\n\n🔐 Saved logins: encrypted remote recovery enabled. Temporary disconnects reconnect automatically. Telegram-revoked sessions still require /login.'
         return await respond(e,text,buttons)
+    if cmd == 'support':
+        return await respond(e,'🆘 SUPPORT\n━━━━━━━━━━━━━━━━━━━━\n\nBot mein problem? Contact @SyntaxError_2.\n\nSaath bhejein: command/route ID, error screenshot aur approximate time.\n\nOTP, password, StringSession ya backup encryption key kabhi share na karein.',support_buttons())
     if cmd == 'id':
         reply = await e.get_reply_message() if e.is_reply else e.message
         tid = topic_id(reply)
         return await respond(e,f'Chat ID: {e.chat_id}\nYour ID: {uid}\nTopic ID: {tid if getattr(getattr(reply,"reply_to",None),"forum_topic",False) else "General / no topic"}\nMessage ID: {reply.id}')
     if cmd == 'login':
-        await start_login(e)
-        if arg:
+        started=await start_login(e)
+        if arg and started:
             e.message.message = arg
             await login_input(e)
         return
@@ -893,14 +978,21 @@ async def command(e,cmd,arg):
         saved=DB.get(uid,'session')
         if not saved:
             raise ValueError('No saved session; /login first')
-        await connect_user(uid,saved)
+        await ensure_session(uid,force=True)
         return await respond(e,'✅ Your saved session reconnected. /watchlist to check restored routes.')
     if cmd == 'cancellogin':
         await close_login(uid)
         return await respond(e,'Login cancelled.')
     if cmd == 'logout':
+        if DB.get(uid,'session') and uid not in USER_CLIENTS:
+            try:
+                await ensure_session(uid,force=True)
+            except LoginRequired:
+                pass
         await disconnect_user(uid,revoke=True)
         DB.set(uid,'session','')
+        if RECOVERY:RECOVERY.forget(uid)
+        await durable_flush(critical=True)
         await close_login(uid)
         return await respond(e,'Your Telegram session was logged out. Watch routes remain paused until you /login.')
     if cmd == 'session':
@@ -909,16 +1001,15 @@ async def command(e,cmd,arg):
         with contextlib.suppress(Exception):
             await e.delete()
         await connect_user(uid,arg)
-        return await respond(e,'✅ Your session imported and encrypted.')
+        synced=await durable_flush(critical=True)
+        return await respond(e,'✅ Your session imported and encrypted.'+(' Remote recovery saved.' if CHECKPOINTS and synced else ' Remote recovery pending/unconfigured.'))
     if cmd == 'exportsession':
         session = DB.get(uid,'session')
         if not session:
             raise ValueError('No session to export')
         return await respond(e,'This exports full account access. Confirm only in your own private chat.',[[Button.inline('Export my session',b'export_confirm')]])
     if cmd in ('chats','dialogs'):
-        cl = USER_CLIENTS.get(uid)
-        if not cl:
-            raise ValueError('/login first')
+        cl = await ensure_session(uid)
         lines = []
         async for d in cl.iter_dialogs(limit=100):
             lines.append(f'{d.id}: {d.name}')
@@ -926,15 +1017,13 @@ async def command(e,cmd,arg):
         buf.name = 'my_chats.txt'
         return await BOT.send_file(uid,buf,caption='Your first 100 dialogs',parse_mode=None)
     if cmd == 'join':
-        cl = USER_CLIENTS.get(uid)
-        if not cl:
-            raise ValueError('/login first')
+        cl = await ensure_session(uid)
         invite = re.search(r't\.me/(?:\+|joinchat/)([\w-]+)',arg)
         result = await retry(cl,ImportChatInviteRequest(invite[1])) if invite else await retry(cl,JoinChannelRequest(source_ref(arg)))
         return await respond(e,'Join request processed. Approval may be required by the channel admin.')
     if cmd in ('forward','publicforward'):
-        if cmd == 'forward' and uid not in USER_CLIENTS:
-            raise ValueError('/login first for private sources')
+        if cmd == 'forward':
+            await ensure_session(uid)
         PANELS[uid] = dict(step='first',cfg=cfg_for(uid))
         return await respond(e,'Send FIRST post link. Then last link / ID. /cancel to exit.')
     if cmd == 'save':
@@ -955,8 +1044,7 @@ async def command(e,cmd,arg):
     if cmd == 'grouptransfer':
         return await group_transfer(e,arg)
     if cmd == 'bottransfer':
-        if uid not in USER_CLIENTS:
-            raise ValueError('/login first')
+        await ensure_session(uid)
         bits = arg.split()
         if not bits:
             raise ValueError('/bottransfer @bot [first ID] [last ID]')
@@ -1071,7 +1159,8 @@ async def command(e,cmd,arg):
         row = next((r for r in DB.users() if r[0]==uid),None)
         job = JOBS.get(uid)
         text = f"V{VERSION} | Your ID: {uid}\nLogged in: {uid in USER_CLIENTS}\nTarget: {cfg['target']}\nRoutes: {len(DB.get(uid,'watch',[]))}\nTotal messages sent: {row[5] if row else 0}\nYour job: {str(job['done'])+'/'+str(job['total']) if job else 'Idle'}\nPending resume: {bool(DB.get(uid,'pending_job'))}\nUptime: {int(time.time()-START)}s\nProcess peak RAM: {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1024:.1f} MiB\nWorkers: {cfg['workers']} | connections: {cfg['connections']}\nFile cap: {MAX_FILE//1048576} MiB (Telegram account limits also apply)\nNo paid plans configured. Server uses bounded shared capacity."
-        return await respond(e,text)
+        text+='\n\nSession health: '+str(RECOVERY.status(uid)['state'] if RECOVERY else 'not monitored')+'\nStorage: '+storage_status()
+        return await respond(e,text,support_buttons())
     if cmd == 'ping':
         t = time.monotonic()
         msg = await respond(e,'Pinging Telegram…')
@@ -1092,7 +1181,7 @@ async def command(e,cmd,arg):
 
 
 ADMIN_COMMANDS = {'admin','users','broadcast','ban','unban','approve','alljobs','access','backup','restore'}
-COMMANDS = set('start help id login reconnect cancellogin logout session exportsession chats dialogs join forward publicforward save batch grouptransfer bottransfer cancel stop resume discard watch watchlist unwatch settarget setchannel setmode setfilter settypes setworkers setconnections setdelay setpoll setcaption clearcaption clearreplace replace replaces settings reset status stats myplan dyno_status ping cleanup_ram'.split()) | ADMIN_COMMANDS
+COMMANDS = set('start help support id login reconnect cancellogin logout session exportsession chats dialogs join forward publicforward save batch grouptransfer bottransfer cancel stop resume discard watch watchlist unwatch settarget setchannel setmode setfilter settypes setworkers setconnections setdelay setpoll setcaption clearcaption clearreplace replace replaces settings reset status stats myplan dyno_status ping cleanup_ram'.split()) | ADMIN_COMMANDS
 
 
 async def admin(e,cmd,arg):
@@ -1179,7 +1268,7 @@ async def callbacks(e):
         if action == 'watch':
             PANELS[uid] = dict(step='watch')
             return await respond(e,'Send source and optional destination:\n@source @dest:topic\nA post link or -100… ID also works. /cancel')
-        return await command(e,{'login':'login','forward':'forward','settings':'settings','status':'status','help':'help'}.get(action,'help'),'')
+        return await command(e,{'login':'login','forward':'forward','settings':'settings','status':'status','help':'help','support':'support'}.get(action,'help'),'')
     if data == 'stopjob':
         await stop_job(uid)
         return await respond(e,'Your transfer stopped; /resume available.')
@@ -1242,8 +1331,8 @@ async def callbacks(e):
             DB.set(uid,'auto',not DB.get(uid,'auto'))
         elif key == 'sender':
             value = 'User' if DB.get(uid,'sender')=='Bot' else 'Bot'
-            if value=='User' and uid not in USER_CLIENTS:
-                raise ValueError('/login first')
+            if value=='User':
+                await ensure_session(uid)
             DB.set(uid,'sender',value)
         elif key == 'mode':
             modes = ['turbo','forward','download','copy']
@@ -1268,6 +1357,8 @@ async def callbacks(e):
             await disconnect_user(uid,revoke=True)
         await close_login(uid)
         DB.reset(uid,keep=action=='keep')
+        if RECOVERY and action=='logout':RECOVERY.forget(uid)
+        await durable_flush(critical=True)
         PANELS.pop(uid,None)
         shutil.rmtree(ROOT/f'u_{uid}',ignore_errors=True)
         return await respond(e,'Your settings, routes and checkpoint reset. Login '+('kept.' if action=='keep' else 'logged out.'))
@@ -1277,6 +1368,8 @@ async def callbacks(e):
         route = next((r for r in routes if r['id']==rid),None)
         if not route:
             raise ValueError('Route no longer exists')
+        if action in ('retry','toggle') and route.get('flood_until',0)>time.time():
+            raise ValueError(f'Telegram rate limit: wait {int(route["flood_until"]-time.time())+1}s before retry/resume')
         task = WATCH_TASKS.get((uid,rid))
         if task:
             task.cancel()
@@ -1285,9 +1378,17 @@ async def callbacks(e):
             routes.remove(route)
         elif action == 'toggle':
             route['paused'] = not route.get('paused')
+            if not route['paused']:
+                await ensure_session(uid)
+                route['retry_at']=0
+        elif action == 'retry':
+            if route.get('paused'):raise ValueError('Resume this route first')
+            await ensure_session(uid)
+            route['retry_at']=0
         else:
             raise ValueError('Unknown route action')
         DB.set(uid,'watch',routes)
+        if action!='del' and not route.get('paused'):kick_watch(uid,rid,force=True)
         return await watch_view(e)
     if data.startswith('repl_'):
         rules = DB.get(uid,'replacements')
@@ -1347,19 +1448,46 @@ async def dispatch(e):
             links = parse_links(raw)
             if links:
                 return await start_job(e,links)
+    except AUTH_ERRORS as exc:
+        if RECOVERY:RECOVERY.state[uid]={'state':'revoked','error':type(exc).__name__}
+        await respond(e,'Telegram invalidated this session. /login again; settings/routes are retained. Support: @SyntaxError_2',support_buttons())
     except FloodWaitError as exc:
-        await respond(e,f'Telegram rate limit: wait {exc.seconds}s, then retry. No speed setting can bypass it.')
+        await respond(e,f'Telegram rate limit: wait {exc.seconds}s, then retry. No speed setting can bypass it.',support_buttons())
     except Exception as exc:
         log.warning('Request uid=%s failed: %s',uid,type(exc).__name__)
         # Never echo raw request text: it may contain session/OTP/password.
         safe = str(exc)[:350] if isinstance(exc,(ValueError,IOError)) else type(exc).__name__
-        await respond(e,'❌ '+safe+'\n/help · /cancel')
+        await respond(e,'❌ '+safe+'\n\n/help · /cancel\nSupport: @SyntaxError_2',support_buttons())
+    finally:
+        mutations={'settarget','setchannel','watch','unwatch','setmode','setcaption','clearcaption','replace','clearreplace','setworkers','setconnections','setdelay','setpoll','setfilter','settypes','logout','session','access','ban','unban','approve','discard'}
+        if CHECKPOINTS and ((match and match[1].lower() in mutations) or (is_callback and e.data.startswith((b'watch_',b'set_',b'repl_',b'reset_',b'adm_confirm_')))):
+            await durable_flush(critical=True)
 
 
 async def health(request):
     return web.json_response(dict(ok=bool(BOT and BOT.is_connected()),v=VERSION,uptime=int(time.time()-START),
-                                  persistence='external' if os.getenv('PERSISTENT_STORAGE')=='1' else 'ephemeral',
+                                  persistence='encrypted-checkpoints' if CHECKPOINTS else 'external' if os.getenv('PERSISTENT_STORAGE')=='1' else 'ephemeral',
+                                  checkpoint_ok=not bool(CHECKPOINTS.remote.error) if CHECKPOINTS else False,
+                                  checkpoint_age=int(time.time()-CHECKPOINTS.remote.last_success) if CHECKPOINTS and CHECKPOINTS.remote.last_success else None,
                                   session_encryption=bool(DB and DB.cipher)))
+
+
+async def checkpoint_loop():
+    while not STOPPING:
+        await asyncio.sleep(max(30,int(os.getenv('STATE_SYNC_SECONDS','300'))))
+        await durable_flush()
+
+
+async def session_monitor():
+    while not STOPPING:
+        for uid,*_ in DB.users():
+            if not DB.allowed(uid) or not DB.get(uid,'session'):
+                continue
+            try:
+                await ensure_session(uid,optional=True)
+            except (LoginRequired,SessionUnavailable):
+                pass
+        await asyncio.sleep(15)
 
 
 async def transport_selftest():
@@ -1427,7 +1555,7 @@ async def migrate_routes(uid):
 
 
 async def main():
-    global BOT,DB,TRANSFER_LIMIT,USERNAME,STOPPING
+    global BOT,DB,TRANSFER_LIMIT,USERNAME,STOPPING,CHECKPOINTS,RECOVERY
     if not API_ID or not API_HASH or not BOT_TOKEN:
         raise RuntimeError('API_ID, API_HASH and BOT_TOKEN are required')
     ROOT.mkdir(parents=True,exist_ok=True)
@@ -1436,8 +1564,14 @@ async def main():
         if p.is_dir():
             shutil.rmtree(p,ignore_errors=True)
     DB = Store(DB_PATH,OWNER_ID,os.getenv('SESSION_KEY'))
-    DB.global_set('broadcast_active',False)
     DB.touch(OWNER_ID,'Owner','')
+    if os.getenv('STATE_REPO_SSH'):
+        remote=GitState(os.environ['STATE_REPO_SSH'],os.getenv('STATE_SSH_KEY'),os.getenv('STATE_KNOWN_HOSTS'),os.getenv('STATE_BRANCH','main'))
+        CHECKPOINTS=Checkpoints(remote,DB,OWNER_ID,allow_initialize=False)
+        restored=await CHECKPOINTS.recover_and_claim()
+        log.info('Encrypted remote state %s; exclusive checkpoint writer claimed','restored' if restored else 'initialized')
+    DB.global_set('broadcast_active',False)
+    RECOVERY=SessionRecovery(DB,USER_CLIENTS,connect_user)
     TRANSFER_LIMIT = asyncio.Semaphore(int(os.getenv('GLOBAL_TRANSFERS','2')))
     bot_session = StringSession()
     if os.getenv('BOT_DC_ID') and os.getenv('BOT_DC_IP'):
@@ -1469,13 +1603,15 @@ async def main():
         try:
             saved = DB.get(uid,'session')
             if saved:
-                await connect_user(uid,saved)
+                await ensure_session(uid)
                 await migrate_routes(uid)
         except Exception as exc:
             log.warning('Restore uid=%s: %s',uid,type(exc).__name__)
     # Legacy owner settings may exist even without a users row; owner is always registered.
     spawn(poll_loop())
     spawn(maintenance())
+    spawn(session_monitor())
+    if CHECKPOINTS:spawn(checkpoint_loop())
     if os.getenv('RUN_TRANSPORT_SELFTEST')=='1':
         spawn(transport_selftest())
     log.info('V%s ready @%s; access=%s; persistent=%s',VERSION,USERNAME,DB.global_get('access','open'),os.getenv('PERSISTENT_STORAGE','0'))
@@ -1492,6 +1628,10 @@ async def main():
         for task in list(BACKGROUND):
             task.cancel()
         await asyncio.gather(*list(BACKGROUND),return_exceptions=True)
+        if CHECKPOINTS:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(durable_flush(critical=True),20)
+            CHECKPOINTS.remote.close()
         await runner.cleanup()
         await BOT.disconnect()
         DB.close()

@@ -20,9 +20,11 @@ PAGES = {
 
 Neeche category select karein. Har page par commands aur examples milenge.
 
+🆘 Problem? /support → @SyntaxError_2. OTP/password/session key kabhi share na karein.
+
 🔒 Login/settings private chat mein use karein. /id groups aur topics mein bhi kaam karta hai.'''),
 'login': ('🔐 LOGIN & ACCOUNT', '''/login
-   Phone + inline OTP keypad se apna account connect karein.
+   Pehli baar phone + inline OTP keypad se connect karein. Already-valid saved login ho to naya OTP nahi maanga jaata. Temporary disconnect automatic retry hota hai; revoked/expired Telegram session mein fresh login zaroori hai.
 
 /reconnect
    Backup restore ke baad apni saved session ko bina naya OTP maange reconnect karne ki koshish karein. Expired ho to /login.
@@ -191,9 +193,12 @@ Original unmodified captions ke entities preserve hote hain. Customized text pla
 /backup — encrypted database backup document.
 /restore — reply to backup file, preview + confirmation.
 
-⚠ Free Render storage ephemeral hai. Website banane se persistence nahi milti. Backup recovery manual hai, always-on database nahi. Latest backup + unchanged SESSION_KEY zaroori hain.
+🔐 /status mein storage health dekhein. Encrypted remote checkpoints configured hon to startup saved logins/settings restore karta hai. Login snapshots immediately sync karne ki koshish hoti hai; routine changes periodic hain.
 
-External free databases ke bhi quotas hote hain. Is deployment mein external DB configure nahi kiya gaya hai.'''),
+Free Render ka local disk ab bhi ephemeral hai. Git checkpoints transactional database nahi hain; quotas/outages apply. Manual /backup fallback rakhein.
+
+/support
+   Bot issues ke liye @SyntaxError_2 se contact karein. OTP/password/session string share na karein.'''),
 'admin': ('👑 OWNER COMMAND GUIDE', '''/admin
    Interactive control centre: users, jobs, routes, access, broadcast aur backup.
 
@@ -242,7 +247,7 @@ def help_page(page='home',owner=False):
 
 # Telegram slash-menu order: everyday actions first, then settings/account/tools.
 SLASH_MENU = [
-('start','🏠 Main menu and quick start'),('help','📖 Category-wise command guide'),
+('start','🏠 Main menu and quick start'),('help','📖 Category-wise command guide'),('support','🆘 Contact @SyntaxError_2 for help'),
 ('forward','📤 Private transfer settings panel'),('publicforward','🌐 Public-source transfer panel'),
 ('watchlist','🔴 Manage automatic routes'),('watch','➕ Add a live source/destination route'),
 ('unwatch','🗑 Remove a live route'),('status','📊 My current transfer status'),
