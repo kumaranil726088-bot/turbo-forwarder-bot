@@ -1,13 +1,30 @@
-# Turbo Forwarder V6.0 — Multi-User Edition
+# Turbo Forwarder V6.1 — Organized Controls Edition
 
 Telegram bot: **@TurboForwarderPro_Bot**. Open access is the default: `OWNER_ID` controls administration, not ordinary forwarding.
+
+
+## V6.1 interface and owner controls
+
+- `/help` and `/start` now show a spaced quick-start page and category navigation: Login, Transfer, Jobs, Auto-Forward, Settings, Captions, Tools, and owner-only Admin guide. Commands have individual descriptions/examples, not dense slash-separated paragraphs. Plain text avoids escaped HTML artifacts.
+- Telegram's slash menu lists all ordinary commands in task order. An owner-specific scope adds owner commands first. Owner-only help/navigation remains hidden from ordinary users.
+- `/admin` is a real interactive control centre: paginated users, numeric user search, per-user details, ban/unban, whitelist approval/revocation, job inspection/stop, all users' route status/errors, pause/resume/delete, access mode and broadcast preview. Sensitive/destructive button actions require a short-lived, single-use confirmation; navigating away invalidates old confirmations.
+- Admin moderation never exports another user's session or exposes OTP/passwords. It does not permit arbitrary actions as another Telegram account. Route resume requires that user to be logged in and allowed. Whitelist changes stop running public-source jobs too, not just jobs with connected user sessions.
+- Live route lists are paginated. Very long tool output is split safely within Telegram's UTF-16 message limit.
+- `/backup` sends an authenticated Fernet-encrypted `.tbackup` logical database snapshot to the owner DM. Contains registered users, encrypted sessions, settings, routes and checkpoints. The same unchanged `SESSION_KEY` and owner ID are required for restore. Backups do **not** include media/custom-thumbnail files. Maximum backup size: 10 MiB.
+- `/restore` must reply to that backup file. It validates encryption, owner, schema/rows and session decryption, previews counts, then asks confirmation. Replacement is an atomic DB transaction; active runtime transfers/sessions are disconnected first. Existing newer DB state is overwritten. Restore is blocked during a broadcast.
+- `/reconnect` lets each user reconnect **only their own** restored saved session without a fresh OTP where Telegram still accepts it. Otherwise use `/login`.
+- Backup is owner-triggered/manual, **not scheduled or an external database**. Save a backup before deploys. Free Render sleep and ephemeral filesystem limits still apply. Creating a website cannot remove hosting/storage quotas. An external DB needs separately supplied account/connection credentials; none was provisioned by this change.
+
+Testing: `python -m unittest test_v6 test_ui -v` runs 64 offline unit/mocked-integration tests. These do not certify end-to-end private/restricted-channel transfers or Telegram permissions. V6 live transport verification is documented separately in the workspace research notes.
 
 ## Architecture
 
 - `bot.py`: command/callback router, private-chat security gates, isolated logins/jobs/panels, ordered prefetch pipeline, event-driven live routes and catch-up, real forum creation, HTTP health service.
 - `storage.py`: parameterized SQLite tables `users`, `user_settings(uid,key)`, `global_settings`; legacy V5 settings migrate to the owner once. Telegram sessions are Fernet-encrypted using `SESSION_KEY`. Plaintext legacy rows are securely removed after migration.
 - `transfer.py`: public/private/topic/range link parsing, album helpers, bounded parallel MTProto download/upload using 512-KiB chunks, separate MTProto senders, cross-DC authorization export/import, normal Telethon fallback.
-- `test_v6.py`: offline unit and mocked-integration regression suite. Run `python -m unittest test_v6 -v`.
+- `help_ui.py`: paginated command guide and full slash menu definitions.
+- `control_ui.py`: owner moderation interface, confirmations and encrypted backup/restore flows.
+- `test_v6.py` + `test_ui.py`: offline unit and mocked-integration regression suite. Run `python -m unittest test_v6 test_ui -v`.
 
 Each user has a separate Telegram account session, destination, settings, active job, resume checkpoint, temporary directory and watch routes. A user cannot export another user's session or use shared bot admin privileges to gain access to unrelated destination channels. Imported/logged-in accounts must match the requesting Telegram user ID. Owner administration requires exactly `OWNER_ID`; forwarding is not owner-gated.
 
@@ -63,7 +80,7 @@ Default destination is the user's own private chat. User sender with this destin
 ## Commands
 
 ### Login
-`/login [phone]`, `/cancellogin`, `/session <StringSession>`, `/exportsession` (private confirmation), `/logout` (Telegram logout), `/chats` or `/dialogs` (up to 100 dialogs as TXT), `/join <@channel or invite>`.
+`/login [phone]`, `/reconnect`, `/cancellogin`, `/session <StringSession>`, `/exportsession` (private confirmation), `/logout` (Telegram logout), `/chats` or `/dialogs` (up to 100 dialogs as TXT), `/join <@channel or invite>`.
 
 ### Transfer
 `/forward`, `/publicforward`, `/save <post links/ranges>`, `/batch <first link> <last ID or link>`, `/grouptransfer <source> [message limit]`, `/bottransfer <@bot> [first ID] [last ID]`, `/status`, `/stop` or `/cancel`, `/resume`, `/discard`.
@@ -81,13 +98,13 @@ The forwarding panel supports job-only promo, caption, filename/caption rename (
 Types: text, photo, video, document, audio, voice, animation, sticker, poll. Captions: `{original}`, `{caption}`, `{index}`, `{title}`. `/settings` buttons change actual per-user auto-detection, sender and transfer mode. `/myplan` reports configured limits rather than an invented subscription. RAM reported is process peak RAM, not per-user RAM. Cleanup never erases another user's downloads or active transfer files.
 
 ### Owner only
-`/admin`, `/users` (TXT export), `/broadcast <text>` (actual delivery counts), `/ban <uid>`, `/unban <uid>`, `/approve <uid>`, `/alljobs`, `/access open|whitelist`. Users must register with `/start` before user-specific admin actions. Default access is `open`.
+`/admin`, `/users` (paginated management; TXT export button), `/broadcast <text>` (actual delivery counts), `/ban <uid>`, `/unban <uid>`, `/approve <uid>`, `/alljobs`, `/access open|whitelist`, `/backup`, `/restore`. Users must register with `/start` before user-specific admin actions. Default access is `open`.
 
 ## Operational checks
 
 ```bash
-python -m py_compile bot.py storage.py transfer.py test_v6.py
-python -m unittest test_v6 -v
+python -m py_compile bot.py storage.py transfer.py help_ui.py control_ui.py test_v6.py test_ui.py
+python -m unittest test_v6 test_ui -v
 curl https://YOUR-SERVICE/health
 ```
 

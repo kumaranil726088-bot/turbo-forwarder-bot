@@ -99,3 +99,88 @@ class Store:
         self.db.commit()
     def close(self):
         self.db.close()
+
+    def snapshot(self, owner):
+        """Authenticated encrypted logical snapshot, independent of SQLite WAL layout."""
+        if not self.cipher:
+            raise ValueError('SESSION_KEY is required for encrypted backups')
+        if owner != self.owner:
+            raise ValueError('Owner mismatch')
+        rows = self.db.execute('SELECT uid,name,username,joined_at,banned,role,total_ok FROM users ORDER BY uid').fetchall()
+        # Do not back up a stale broadcast lock or in-memory confirmation tokens.
+        globals_ = self.db.execute("SELECT key,value FROM global_settings WHERE key!='broadcast_active'").fetchall()
+        data = dict(format='turbo-backup-1',owner=owner,created=time.time(),users=rows,
+                    user_settings=self.db.execute('SELECT uid,key,value FROM user_settings').fetchall(),global_settings=globals_)
+        encrypted=self.cipher.encrypt(json.dumps(data,ensure_ascii=False,allow_nan=False).encode())
+        if len(encrypted)>10*1024*1024:
+            raise ValueError('Backup exceeds supported 10 MiB; use external database backup tooling')
+        return encrypted
+
+    def decode_snapshot(self, blob, owner):
+        if not self.cipher:
+            raise ValueError('SESSION_KEY is required for restore')
+        if len(blob)>10*1024*1024:
+            raise ValueError('Backup exceeds 10 MiB')
+        try:
+            plain=self.cipher.decrypt(blob)
+            data=json.loads(plain)
+            self.validate_snapshot(data,owner)
+            return data
+        except Exception as exc:
+            raise ValueError('Invalid backup, wrong owner, or different SESSION_KEY') from exc
+
+    def validate_snapshot(self, data, owner):
+        import math
+        if not isinstance(data,dict) or data.get('format')!='turbo-backup-1' or data.get('owner')!=owner or owner!=self.owner:
+            raise ValueError('Backup format/owner mismatch')
+        if not isinstance(data.get('created'),(int,float)) or not math.isfinite(data['created']):
+            raise ValueError('Invalid backup timestamp')
+        for key in ('users','user_settings','global_settings'):
+            if not isinstance(data.get(key),list) or len(data[key])>100000:
+                raise ValueError('Invalid backup table')
+        ids=set()
+        for row in data['users']:
+            if not isinstance(row,(list,tuple)) or len(row)!=7:
+                raise ValueError('Invalid users row')
+            uid,name,username,joined,banned,role,total=row
+            if type(uid)!=int or uid<=0 or uid in ids or not isinstance(name,str) or not isinstance(username,str):
+                raise ValueError('Invalid user identity')
+            if not isinstance(joined,(int,float)) or not math.isfinite(joined) or banned not in (0,1) or role not in ('user','approved','owner') or type(total)!=int or total<0:
+                raise ValueError('Invalid user metadata')
+            if (role=='owner') != (uid==owner):
+                raise ValueError('Invalid owner role')
+            ids.add(uid)
+        if owner not in ids:
+            raise ValueError('Owner missing from backup')
+        seen=set()
+        for row in data['user_settings']:
+            if not isinstance(row,(list,tuple)) or len(row)!=3:
+                raise ValueError('Invalid settings row')
+            uid,key,raw=row
+            if uid not in ids or not isinstance(key,str) or not key or not isinstance(raw,str) or (uid,key) in seen:
+                raise ValueError('Invalid settings identity')
+            seen.add((uid,key))
+            value=json.loads(raw)
+            if key=='session' and value:
+                self.cipher.decrypt(value.encode())
+            if key=='watch' and (not isinstance(value,list) or any(not isinstance(r,dict) or not all(k in r for k in ('id','src','target')) for r in value)):
+                raise ValueError('Invalid route snapshot')
+        seen=set()
+        for row in data['global_settings']:
+            if not isinstance(row,(list,tuple)) or len(row)!=2:
+                raise ValueError('Invalid global row')
+            key,raw=row
+            if not isinstance(key,str) or not isinstance(raw,str) or key in seen:
+                raise ValueError('Invalid global setting')
+            json.loads(raw);seen.add(key)
+
+    def restore_snapshot(self, data, owner):
+        self.validate_snapshot(data,owner)
+        # One atomic DB transaction: either all snapshot rows replace current state, or none do.
+        with self.db:
+            for table in ('user_settings','global_settings','users'):
+                self.db.execute('DELETE FROM '+table)
+            self.db.executemany('INSERT INTO users(uid,name,username,joined_at,banned,role,total_ok) VALUES(?,?,?,?,?,?,?)',data['users'])
+            self.db.executemany('INSERT INTO user_settings VALUES(?,?,?)',data['user_settings'])
+            self.db.executemany('INSERT INTO global_settings VALUES(?,?)',data['global_settings'])
+            self.db.execute("INSERT INTO global_settings VALUES('broadcast_active','false') ON CONFLICT(key) DO UPDATE SET value='false'")

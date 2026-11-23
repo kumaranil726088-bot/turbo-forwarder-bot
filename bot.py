@@ -13,6 +13,7 @@ import os
 import re
 import resource
 import shutil
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -25,16 +26,18 @@ from telethon.extensions import html as tl_html
 from telethon.tl.functions.bots import SetBotCommandsRequest
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest, GetForumTopicsRequest, CreateForumTopicRequest
-from telethon.tl.types import BotCommand, BotCommandScopeDefault, DocumentAttributeFilename, Channel
+from telethon.tl.types import BotCommand, BotCommandScopeDefault, BotCommandScopePeer, DocumentAttributeFilename, Channel
 from telethon.errors import SessionPasswordNeededError, FloodWaitError
 
+import control_ui
+from help_ui import help_page, SLASH_MENU, OWNER_MENU
 from storage import Store, DEFAULTS
 from transfer import Parallel, TYPES, parse_links, parse_post_link, source_ref, destination, msg_type, topic_id, renamed, retry
 
 from dotenv import load_dotenv
 load_dotenv()
 
-VERSION = '6.0'
+VERSION = '6.1'
 START = time.time()
 API_ID = int(os.getenv('API_ID','0'))
 API_HASH = os.getenv('API_HASH','')
@@ -87,6 +90,20 @@ def cfg_for(uid):
 
 
 async def respond(e,text,buttons=None):
+    if len(text.encode('utf-16-le'))//2>3900:
+        # Telegram limits message length in UTF-16 units; split even emoji-heavy output safely.
+        chunks=[]
+        while text:
+            cut=min(1800,len(text))
+            if cut<len(text):
+                boundary=text.rfind('\n',0,cut)
+                if boundary>cut//2:
+                    cut=boundary+1
+            chunks.append(text[:cut]);text=text[cut:]
+        result=None
+        for i,chunk in enumerate(chunks):
+            result=await e.respond(chunk,parse_mode=None,link_preview=False,buttons=buttons if i==len(chunks)-1 else None)
+        return result
     kw = dict(parse_mode=None,buttons=buttons,link_preview=False)
     if isinstance(e,events.CallbackQuery.Event):
         try:
@@ -607,41 +624,7 @@ def menu():
             [Button.inline('🔴 Auto-Forward',b'menu_watch'),Button.inline('⚙ My settings',b'menu_settings')],
             [Button.inline('📊 My status',b'menu_status'),Button.inline('❓ Commands',b'menu_help')]]
 
-HELP = '''⚡ Turbo Forwarder V6.0 — Multi-User
-Every user has their own session, settings, job, resume and live routes.
-
-LOGIN (private chat only)
-/login · /cancellogin · /logout · /session <StringSession>
-/exportsession · /chats (/dialogs) · /join <invite or @channel>
-
-TRANSFER
-/forward · /publicforward — first/end links + settings panel
-/save <post link or ranges> · /batch <first link> <last ID or link>
-/grouptransfer <source> [limit 1–10000]
-/bottransfer <@bot> [first ID] [last ID]
-/resume · /discard · /status · /stop (/cancel)
-Send a small .txt with links/ranges to transfer them.
-
-AUTOMATIC
-/watch <@channel, -100ID, or post link> [destination[:topic]]
-/watchlist · /unwatch <route ID or all>
-Live event hook + restart catch-up. Routes start from latest post when added.
-
-SETTINGS
-/setchannel (/settarget) <destination[:topic]> · /id
-/setmode <turbo|forward|download|copy>
-/setworkers <1–5> · /setconnections <1–6>
-/setdelay <seconds> · /setpoll <seconds>
-/setfilter <all|text> · /settypes <text,photo,video,document,audio,voice,animation,sticker,poll>
-/setcaption <text with {original} {index} {title}> · /clearcaption
-/replace <old>|<new> · /replaces · /clearreplace
-/settings · /reset · /ping · /stats · /myplan
-/cleanup_ram · /dyno_status
-
-OWNER: /admin /users /broadcast /ban /unban /approve /alljobs /access
-
-Private sources require your own channel membership. Re-upload is attempted only where Telegram permits downloading. No speed guarantee or permission bypass. Use only authorized content.
-Use the bot in private chat; /id also works inside groups/topics.'''
+HELP = help_page('home')[0]  # compatibility for tooling; command pages are served dynamically
 
 
 def panel_buttons(st):
@@ -812,14 +795,20 @@ async def settings_view(e):
                           [Button.inline('Cycle mode',b'set_mode'),Button.inline('Reset options',b'reset_menu')]])
 
 
-async def watch_view(e):
+async def watch_view(e,page=0):
     routes = DB.get(e.sender_id,'watch',[])
-    text = '🔴 Your live routes\n'
+    text = '🔴 YOUR AUTOMATIC ROUTES\n━━━━━━━━━━━━━━━━━━━━\n\nNew messages use live events + polling catch-up.\nPause keeps the cursor; Resume copies backlog.\n'
+    page=max(0,min(page,max(0,(len(routes)-1)//5)))
+    text+=f'\nPage {page+1} • Routes: {len(routes)}\n'
     buttons = []
-    for r in routes:
-        text += f"\n{r['id']} {'⏸' if r.get('paused') else '▶'} {r['src']} → {r['target']}\nLast: {r.get('last')} | {r.get('error') or 'OK'}\n"
+    for r in routes[page*5:(page+1)*5]:
+        text += f"\n{'⏸ PAUSED' if r.get('paused') else '🟢 ACTIVE'} • {r['id']}\n\nSource: {r['src']}\nDestination: {r['target']}\nLast confirmed ID: {r.get('last')}\nStatus: {r.get('error') or 'OK'}\n━━━━━━━━━━━━━━━━━━━━\n"
         buttons.append([Button.inline('Resume' if r.get('paused') else 'Pause',('watch_toggle_'+r['id']).encode()),Button.inline('Delete '+r['id'],('watch_del_'+r['id']).encode())])
-    buttons.append([Button.inline('➕ Add route',b'menu_watch')])
+    nav=[]
+    if page:nav.append(Button.inline('← Previous',f'watchpage_{page-1}'.encode()))
+    if (page+1)*5<len(routes):nav.append(Button.inline('Next →',f'watchpage_{page+1}'.encode()))
+    if nav:buttons.append(nav)
+    buttons.append([Button.inline('➕ Add route',b'menu_watch'),Button.inline('📖 Guide',b'help_watch')])
     await respond(e,text if routes else text+'No routes yet.',buttons)
 
 
@@ -886,8 +875,10 @@ async def group_transfer(e,arg):
 async def command(e,cmd,arg):
     uid = e.sender_id
     if cmd in ('start','help'):
-        persistence = '\n⚠ This free Render instance has ephemeral storage: redeploy/restart may erase saved settings and logins. Owner: configure a persistent disk or database for durable recovery.' if os.getenv('PERSISTENT_STORAGE')!='1' else ''
-        return await respond(e,HELP+persistence,menu())
+        text,buttons = help_page(arg or 'home',owner=uid==OWNER_ID)
+        if os.getenv('PERSISTENT_STORAGE')!='1' and (arg or 'home')=='home':
+            text += '\n\n💾 Free hosting: restart/redeploy may erase local state. Owner: /backup before changes; /help tools for recovery details.'
+        return await respond(e,text,buttons)
     if cmd == 'id':
         reply = await e.get_reply_message() if e.is_reply else e.message
         tid = topic_id(reply)
@@ -898,6 +889,12 @@ async def command(e,cmd,arg):
             e.message.message = arg
             await login_input(e)
         return
+    if cmd == 'reconnect':
+        saved=DB.get(uid,'session')
+        if not saved:
+            raise ValueError('No saved session; /login first')
+        await connect_user(uid,saved)
+        return await respond(e,'✅ Your saved session reconnected. /watchlist to check restored routes.')
     if cmd == 'cancellogin':
         await close_login(uid)
         return await respond(e,'Login cancelled.')
@@ -974,6 +971,9 @@ async def command(e,cmd,arg):
             raise ValueError('Choose positive IDs, up to 10,000 messages')
         return await start_job(e,[(str(ent.id),i) for i in range(first,last+1)])
     if cmd in ('cancel','stop'):
+        control_ui.INPUT.pop(uid,None)
+        if uid==OWNER_ID:
+            control_ui.CONFIRM.clear()
         PANELS.pop(uid,None)
         await close_login(uid)
         await stop_job(uid)
@@ -1070,7 +1070,7 @@ async def command(e,cmd,arg):
         cfg = cfg_for(uid)
         row = next((r for r in DB.users() if r[0]==uid),None)
         job = JOBS.get(uid)
-        text = f"V6.0 | Your ID: {uid}\nLogged in: {uid in USER_CLIENTS}\nTarget: {cfg['target']}\nRoutes: {len(DB.get(uid,'watch',[]))}\nTotal messages sent: {row[5] if row else 0}\nYour job: {str(job['done'])+'/'+str(job['total']) if job else 'Idle'}\nPending resume: {bool(DB.get(uid,'pending_job'))}\nUptime: {int(time.time()-START)}s\nProcess peak RAM: {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1024:.1f} MiB\nWorkers: {cfg['workers']} | connections: {cfg['connections']}\nFile cap: {MAX_FILE//1048576} MiB (Telegram account limits also apply)\nNo paid plans configured. Server uses bounded shared capacity."
+        text = f"V{VERSION} | Your ID: {uid}\nLogged in: {uid in USER_CLIENTS}\nTarget: {cfg['target']}\nRoutes: {len(DB.get(uid,'watch',[]))}\nTotal messages sent: {row[5] if row else 0}\nYour job: {str(job['done'])+'/'+str(job['total']) if job else 'Idle'}\nPending resume: {bool(DB.get(uid,'pending_job'))}\nUptime: {int(time.time()-START)}s\nProcess peak RAM: {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1024:.1f} MiB\nWorkers: {cfg['workers']} | connections: {cfg['connections']}\nFile cap: {MAX_FILE//1048576} MiB (Telegram account limits also apply)\nNo paid plans configured. Server uses bounded shared capacity."
         return await respond(e,text)
     if cmd == 'ping':
         t = time.monotonic()
@@ -1091,23 +1091,30 @@ async def command(e,cmd,arg):
     await respond(e,'Unknown command. /help')
 
 
-ADMIN_COMMANDS = {'admin','users','broadcast','ban','unban','approve','alljobs','access'}
-COMMANDS = set('start help id login cancellogin logout session exportsession chats dialogs join forward publicforward save batch grouptransfer bottransfer cancel stop resume discard watch watchlist unwatch settarget setchannel setmode setfilter settypes setworkers setconnections setdelay setpoll setcaption clearcaption clearreplace replace replaces settings reset status stats myplan dyno_status ping cleanup_ram'.split()) | ADMIN_COMMANDS
+ADMIN_COMMANDS = {'admin','users','broadcast','ban','unban','approve','alljobs','access','backup','restore'}
+COMMANDS = set('start help id login reconnect cancellogin logout session exportsession chats dialogs join forward publicforward save batch grouptransfer bottransfer cancel stop resume discard watch watchlist unwatch settarget setchannel setmode setfilter settypes setworkers setconnections setdelay setpoll setcaption clearcaption clearreplace replace replaces settings reset status stats myplan dyno_status ping cleanup_ram'.split()) | ADMIN_COMMANDS
 
 
 async def admin(e,cmd,arg):
     uid = e.sender_id
     if uid != OWNER_ID:
         raise ValueError('Owner-only administration. Your own forwarding tools are open to all users.')
+    module = sys.modules[__name__]
     if cmd == 'admin':
-        return await respond(e,f"👑 Super-admin V6\nUsers: {len(DB.users())}\nConnected sessions: {len(USER_CLIENTS)}/{MAX_SESSIONS}\nJobs: {len(JOBS)}\nAccess: {DB.global_get('access','open')}\n/admin /users /alljobs /broadcast <text>\n/ban <uid> /unban <uid> /approve <uid>\n/access open|whitelist",[[Button.inline('Toggle open/whitelist',b'admin_access')]])
+        return await control_ui.home(module,e)
     if cmd == 'users':
+        return await control_ui.users(module,e)
+    if cmd == 'backup':
+        return await control_ui.backup(module,e)
+    if cmd == 'restore':
+        return await control_ui.restore_preview(module,e)
+    if cmd == 'userexport':
         text = '\n'.join(f'{u} | {name} | @{username} | banned={banned} | {role} | sent={n}' for u,name,username,banned,role,n in DB.users()) or 'No users'
         file = io.BytesIO(text.encode())
         file.name = 'users.txt'
         return await BOT.send_file(uid,file,parse_mode=None)
     if cmd == 'alljobs':
-        return await respond(e,'Active jobs:\n'+('\n'.join(f'{u}: {j["done"]}/{j["total"]} sent {j["ok"]}' for u,j in JOBS.items()) or 'None'))
+        return await control_ui.listing(module,e,'jobs')
     if cmd in ('ban','unban','approve'):
         target = int(arg)
         if target == OWNER_ID:
@@ -1124,9 +1131,10 @@ async def admin(e,cmd,arg):
             raise ValueError('/access open|whitelist')
         DB.global_set('access',arg)
         # Stop active transfers immediately when access is revoked.
-        for target in list(USER_CLIENTS):
+        for target in set(USER_CLIENTS) | set(JOBS) | set(LOGINS):
             if not DB.allowed(target):
                 await disconnect_user(target)
+                await close_login(target)
         return await respond(e,'Access mode: '+arg)
     if cmd == 'broadcast':
         if not arg:
@@ -1154,6 +1162,18 @@ async def admin(e,cmd,arg):
 async def callbacks(e):
     uid = e.sender_id
     data = e.data.decode()
+    control_ui.INPUT.pop(uid,None)
+    if uid==OWNER_ID and not data.startswith('adm_confirm_'):
+        control_ui.CONFIRM.clear()
+    if data.startswith('watchpage_'):
+        return await watch_view(e,int(data[10:]))
+    if data.startswith('help_'):
+        text,buttons=help_page(data[5:],owner=uid==OWNER_ID)
+        return await respond(e,text,buttons)
+    if data=='nav_home':
+        return await respond(e,f'⚡ TURBO FORWARDER V{VERSION}\n\nSelect your next action below.\n\n/help — detailed category-wise command guide',menu())
+    if data.startswith('adm_'):
+        return await control_ui.callback(sys.modules[__name__],e,data)
     if data.startswith('menu_'):
         action = data[5:]
         if action == 'watch':
@@ -1307,8 +1327,14 @@ async def dispatch(e):
                 await e.answer()
             return await callbacks(e)
         if match:
+            control_ui.INPUT.pop(uid,None)
+            if uid==OWNER_ID:
+                control_ui.CONFIRM.clear()
             return await command(e,match[1].lower(),(match[3] or '').strip())
+        # A sensitive login flow takes precedence over owner text-input prompts.
         if await login_input(e):
+            return
+        if await control_ui.handle_input(sys.modules[__name__],e):
             return
         if await panel_input(e):
             return
@@ -1421,8 +1447,12 @@ async def main():
     USERNAME = (await BOT.get_me()).username
     BOT.add_event_handler(dispatch,events.NewMessage(incoming=True))
     BOT.add_event_handler(dispatch,events.CallbackQuery())
-    commands = [('start','Home and command reference'),('forward','Forward settings panel'),('watchlist','My live routes'),('settings','My settings'),('login','Connect my account'),('status','My transfer status'),('stop','Stop my transfer'),('admin','Owner administration')]
-    await BOT(SetBotCommandsRequest(BotCommandScopeDefault(),'', [BotCommand(a,b) for a,b in commands]))
+    await BOT(SetBotCommandsRequest(BotCommandScopeDefault(),'', [BotCommand(a,b) for a,b in SLASH_MENU]))
+    try:
+        owner_peer=await BOT.get_input_entity(OWNER_ID)
+        await BOT(SetBotCommandsRequest(BotCommandScopePeer(owner_peer),'', [BotCommand(a,b) for a,b in OWNER_MENU+SLASH_MENU]))
+    except Exception as exc:
+        log.warning('Owner slash menu setup: %s',type(exc).__name__)
     app = web.Application()
     app.router.add_get('/health',health)
     app.router.add_get('/',health)
@@ -1448,7 +1478,7 @@ async def main():
     spawn(maintenance())
     if os.getenv('RUN_TRANSPORT_SELFTEST')=='1':
         spawn(transport_selftest())
-    log.info('V6.0 ready @%s; access=%s; persistent=%s',USERNAME,DB.global_get('access','open'),os.getenv('PERSISTENT_STORAGE','0'))
+    log.info('V%s ready @%s; access=%s; persistent=%s',VERSION,USERNAME,DB.global_get('access','open'),os.getenv('PERSISTENT_STORAGE','0'))
     try:
         await BOT.run_until_disconnected()
     finally:
