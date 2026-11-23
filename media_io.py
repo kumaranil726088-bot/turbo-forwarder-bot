@@ -5,8 +5,9 @@ import asyncio
 from pathlib import Path
 from telethon.errors import FileReferenceExpiredError, FileReferenceInvalidError, FloodWaitError
 from transfer import Parallel,retry
+from queue_tools import ItemUnavailable
 
-async def download_original(client,message,path,connections=4):
+async def download_original(client,message,path,connections=4,progress=None):
     path=Path(path);partial=path.with_name(path.name+'.partial')
     current=message
     for attempt in range(3):
@@ -16,14 +17,14 @@ async def download_original(client,message,path,connections=4):
             try:
                 if size<1024*1024:
                     raise ValueError('Small media uses standard transfer')
-                await Parallel(client,connections).download(current,str(partial))
+                await Parallel(client,connections).download(current,str(partial),**({'progress':progress} if progress else {}))
             except (asyncio.CancelledError,FloodWaitError,FileReferenceExpiredError,FileReferenceInvalidError):
                 raise
             except Exception:
                 # A failed parallel attempt may have preallocated a correctly-sized ZERO file.
                 # Delete it before fallback and require the standard API to return a real file.
                 partial.unlink(missing_ok=True)
-                result=await retry(client.download_media,current,file=str(partial))
+                result=await retry(client.download_media,current,file=str(partial),**({'progress_callback':progress} if progress else {}))
                 if not result:
                     raise IOError('Telegram returned no downloadable media; access/permissions may prevent extraction')
             if not partial.is_file() or not partial.stat().st_size or (size and partial.stat().st_size!=size):
@@ -34,7 +35,7 @@ async def download_original(client,message,path,connections=4):
             if attempt==2:raise
             fresh=await retry(client.get_messages,current.peer_id,ids=current.id)
             if not fresh or not fresh.file:
-                raise ValueError('Source media was removed or is no longer accessible')
+                raise ItemUnavailable('Source media was removed or is no longer accessible')
             current=fresh
         except (OSError,ConnectionError,asyncio.TimeoutError):
             if attempt==2:raise

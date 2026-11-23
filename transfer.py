@@ -104,21 +104,25 @@ class Parallel:
         c = self.client
         dc_id = dc_id or c.session.dc_id
         dc = await c._get_dc(dc_id)
+        async def connect_one():
+            same=dc_id==c.session.dc_id
+            key=AuthKey(c.session.auth_key.key) if same else None
+            sender=MTProtoSender(key,loggers=c._log,retries=2)
+            self.senders.append(sender)
+            await sender.connect(c._connection(dc.ip_address,dc.port,dc.id,loggers=c._log,proxy=c._proxy,local_addr=c._local_addr))
+            init=copy.copy(c._init_request)
+            if same:init.query=GetConfigRequest()
+            else:
+                auth=await retry(c,ExportAuthorizationRequest(dc_id))
+                init.query=ImportAuthorizationRequest(auth.id,auth.bytes)
+            await sender.send(InvokeWithLayerRequest(LAYER,init))
+        tasks=[asyncio.create_task(connect_one()) for _ in range(self.n)]
         try:
-            for _ in range(self.n):
-                same = dc_id == c.session.dc_id
-                key = AuthKey(c.session.auth_key.key) if same else None
-                sender = MTProtoSender(key,loggers=c._log,retries=2)
-                self.senders.append(sender)
-                await sender.connect(c._connection(dc.ip_address,dc.port,dc.id,loggers=c._log,proxy=c._proxy,local_addr=c._local_addr))
-                init = copy.copy(c._init_request)
-                if same:
-                    init.query = GetConfigRequest()
-                else:
-                    auth = await retry(c,ExportAuthorizationRequest(dc_id))
-                    init.query = ImportAuthorizationRequest(auth.id,auth.bytes)
-                await sender.send(InvokeWithLayerRequest(LAYER,init))
+            await asyncio.gather(*tasks)
         except BaseException:
+            for task in tasks:
+                if not task.done():task.cancel()
+            await asyncio.gather(*tasks,return_exceptions=True)
             await self.close()
             raise
     async def close(self):

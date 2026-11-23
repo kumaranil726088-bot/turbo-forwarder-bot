@@ -31,6 +31,7 @@ from telethon.errors import SessionPasswordNeededError, FloodWaitError
 
 import control_ui
 from media_io import download_original
+from queue_tools import ItemUnavailable,ResourceLimit,nonfatal,poll_text,text_chunks,DiskBudget
 from help_ui import help_page, SLASH_MENU, OWNER_MENU
 from remote_state import GitState, Checkpoints, StateConflict
 from sessions import SessionRecovery, LoginRequired, SessionUnavailable, AUTH_ERRORS
@@ -40,7 +41,7 @@ from transfer import Parallel, TYPES, parse_links, parse_post_link, source_ref, 
 from dotenv import load_dotenv
 load_dotenv()
 
-VERSION = '6.2'
+VERSION = '6.3'
 START = time.time()
 API_ID = int(os.getenv('API_ID','0'))
 API_HASH = os.getenv('API_HASH','')
@@ -66,6 +67,8 @@ WATCH_TASKS = {}
 USER_LOCKS = {}
 BACKGROUND = set()
 TRANSFER_LIMIT = None
+DISK = None
+JOB_START_LOCKS = {}
 USERNAME = ''
 STOPPING = False
 CHECKPOINTS = None
@@ -260,44 +263,83 @@ def disk_usage():
     return sum(p.stat().st_size for p in ROOT.rglob('*') if p.is_file()) if ROOT.exists() else 0
 
 
-async def prepare(uid,src,mid,cfg,index,folder,seen):
+def progress_for(uid,kind,key):
+    job=JOBS.get(uid)
+    if not job or f'u_{uid}_{job["id"]}' not in Path(key).parts:return None
+    job_id=job['id']
+    def update(done,total):
+        current=JOBS.get(uid)
+        if not current or current['id']!=job_id:return
+        streams=current.setdefault('streams',{})
+        previous=streams.get((kind,key),0)
+        delta=done-previous if done>=previous else done
+        current[kind+'_bytes']=current.get(kind+'_bytes',0)+max(0,delta)
+        streams[(kind,key)]=done
+        current['phase']=kind.title()+f' {done/1048576:.1f}/{total/1048576:.1f} MiB'
+    return update
+
+
+async def cleanup_files(folder):
+    shutil.rmtree(folder,ignore_errors=True)
+    if DISK:await DISK.release_tree(folder)
+
+
+async def prepare(uid,src,mid,cfg,index,folder,seen,admission=None):
+    if admission:await admission[0].wait()
+    try:
+        item=await prepare_core(uid,src,mid,cfg,index,folder,seen,admission[1] if admission else None)
+        if admission and not admission[1].is_set():
+            # A direct copy may fail and need extraction. Hold later preparations until resolved.
+            item['_release_admission']=admission[1]
+        return item
+    except BaseException:
+        if admission:admission[1].set()
+        await cleanup_files(folder)
+        raise
+
+
+async def prepare_core(uid,src,mid,cfg,index,folder,seen,next_admission=None):
     cl = await fetcher(uid,src)
     source = await entity(cl,src)
     group = await messages_group(cl,source,mid)
     if not group:
-        return {'skip':True,'ids':[mid]}
+        if next_admission:next_admission.set()
+        return {'skip':True,'ids':[mid],'reason':'Missing/service message'}
     all_ids=[m.id for m in group]
     key = (str(src), group[0].grouped_id or group[0].id)
     if key in seen:
-        return {'skip':True,'ids':all_ids}
+        if next_admission:next_admission.set()
+        return {'skip':True,'ids':all_ids,'reason':'Album member already handled or filtered'}
     seen.add(key)
     delivered=set(cfg.get('_delivered_ids',[]))
     group = [m for m in group if m.id not in delivered and msg_type(m) in cfg['type_filters'] and (cfg['filter'] != 'text' or msg_type(m) == 'text')]
     if not group:
-        return {'skip':True,'ids':all_ids}
+        if next_admission:next_admission.set()
+        return {'skip':True,'ids':all_ids,'reason':'Album member already handled or filtered'}
     changed_file = bool(cfg.get('rename') or cfg.get('thumb'))
     restricted = getattr(source,'noforwards',False) or any(getattr(m,'noforwards',False) for m in group)
     # Files are copied with their original session, not a cross-account access hash.
     sender = USER_CLIENTS.get(uid) if cfg.get('sender') == 'User' else BOT
     direct = cl is sender and not restricted and not changed_file and cfg['mode'] != 'download'
-    result = dict(cl=cl,source=source,src_ref=src,msgs=group,files=[],thumbs=[],direct=direct,ids=all_ids,index=index)
+    result = dict(cl=cl,source=source,src_ref=src,msgs=group,files=[],thumbs=[],direct=direct,ids=all_ids,index=index,folder=str(folder))
     if direct or not any(m.file for m in group):
         return result
+    size_needed=sum((m.file.size or 8*1024*1024) for m in group if m.file)
+    if any((m.file.size or 0)>MAX_FILE for m in group if m.file):
+        raise ResourceLimit('File exceeds configured MAX_FILE_MB; native server-side copying has no local download cap when permitted.')
     folder.mkdir(parents=True,exist_ok=True)
+    if DISK:await DISK.reserve(folder,size_needed)
+    if next_admission:next_admission.set()
     async with TRANSFER_LIMIT:
         for m in group:
             if not m.file:
                 continue
             size = m.file.size or 0
-            if size > MAX_FILE:
-                raise ValueError('File exceeds configured MAX_FILE_MB')
-            if disk_usage()+size > DISK_BUDGET or shutil.disk_usage(ROOT).free < size+64*1024*1024:
-                raise ValueError('Disk budget reached; reduce workers/file size')
             name = m.file.name or ('media_'+str(m.id)+(m.file.ext or '.bin'))
             media_dir = folder/str(m.id)
             media_dir.mkdir(exist_ok=True)
             path = media_dir/renamed(name,cfg.get('rename',''),index)
-            await download_original(cl,m,path,cfg['connections'])
+            await download_original(cl,m,path,cfg['connections'],progress=progress_for(uid,'download',str(path)))
             thumb = None
             if cfg.get('thumb'):
                 candidate = ROOT/f'u_{uid}'/'thumb.jpg'
@@ -323,6 +365,20 @@ async def send_media(sender,dest,media,captions,entities,topic):
                        parse_mode=None,reply_to=topic,supports_streaming=True)
 
 
+async def send_nonfile(sender,dest,message,text,entities,topic):
+    if text:
+        await retry(sender.send_message,dest,text,formatting_entities=entities,parse_mode=None,reply_to=topic,link_preview=False)
+        return 1
+    media=getattr(message,'media',None)
+    if media:
+        try:converted=utils.get_input_media(media)
+        except (TypeError,ValueError) as exc:
+            raise ItemUnavailable('Unsupported Telegram media; recorded for review instead of stopping all videos') from exc
+        await retry(sender.send_file,dest,converted,parse_mode=None,reply_to=topic)
+        return 1
+    return 0
+
+
 async def send_prepared(uid,item,cfg,sender,dest,topic):
     if item.get('skip'):
         return 0
@@ -334,36 +390,47 @@ async def send_prepared(uid,item,cfg,sender,dest,topic):
     if item['direct'] and cfg['mode'] == 'forward' and not custom and not topic:
         try:
             await retry(sender.forward_messages,dest,[m.id for m in msgs],from_peer=item['source'])
+            if uid in JOBS and cfg.get('_job_id')==JOBS[uid]['id']:JOBS[uid]['server_copies']=JOBS[uid].get('server_copies',0)+len(msgs)
             return len(msgs)
         except FloodWaitError:
             raise
-        except Exception:
-            # Permission changes between download and send: fall back to extraction.
+        except Exception as exc:
+            if type(exc).__name__ not in {'ChatForwardsRestrictedError','MediaInvalidError','FileReferenceExpiredError','FileReferenceInvalidError'}:raise
             item['direct'] = False
     if any(m.poll for m in msgs):
-        raise ValueError('Poll transfer needs User sender, forward mode, no customizations and no destination topic')
+        count=0
+        for m in msgs:
+            text=poll_text(m) if m.poll else caption(m,cfg,item['index'])[0]
+            for chunk in text_chunks(text):
+                await retry(sender.send_message,dest,chunk,parse_mode=None,reply_to=topic,link_preview=False)
+                count+=1
+        if uid in JOBS and cfg.get('_job_id')==JOBS[uid]['id']:JOBS[uid]['polls']=JOBS[uid].get('polls',0)+sum(bool(m.poll) for m in msgs)
+        return count
     if item['direct']:
         try:
             if group:
                 await send_media(sender,dest,[m.media for m in group],[caption(m,cfg,item['index'])[0] for m in group],
                                      [caption(m,cfg,item['index'])[1] for m in group],topic)
             else:
-                for text,entities in texts:
-                    if text:
-                        await retry(sender.send_message,dest,text,formatting_entities=entities,parse_mode=None,reply_to=topic,link_preview=False)
-            return len(msgs)
+                count=0
+                for m,(text,entities) in zip(msgs,texts):
+                    count+=await send_nonfile(sender,dest,m,text,entities,topic)
+                return count
+            if uid in JOBS and cfg.get('_job_id')==JOBS[uid]['id']:JOBS[uid]['server_copies']=JOBS[uid].get('server_copies',0)+len(group)
+            return len(group)
         except FloodWaitError:
             raise
-        except Exception:
+        except Exception as exc:
+            if type(exc).__name__ not in {'ChatForwardsRestrictedError','MediaInvalidError','MediaEmptyError','FileReferenceExpiredError','FileReferenceInvalidError'}:raise
             item['direct'] = False
     if group and not item['files']:
         # Restricted forwarding or cached-media copy rejected. Re-prepare with extraction.
-        folder = ROOT/f'u_{uid}_{uuid.uuid4().hex[:12]}'
+        folder = Path(item['folder'])/'fallback' if item.get('folder') else ROOT/f'u_{uid}_{uuid.uuid4().hex[:12]}'
         try:
             fallback = await prepare(uid,item.get('src_ref',str(utils.get_peer_id(item['source']))),msgs[0].id,dict(cfg,mode='download'),item['index'],folder,set())
             return await send_prepared(uid,fallback,dict(cfg,mode='download'),sender,dest,topic)
         finally:
-            shutil.rmtree(folder,ignore_errors=True)
+            await cleanup_files(folder)
     if item['files']:
         uploads = []
         for (m,path),thumb in zip(item['files'],item['thumbs']):
@@ -371,12 +438,12 @@ async def send_prepared(uid,item,cfg,sender,dest,topic):
                 try:
                     if os.path.getsize(path) < 1024*1024:
                         raise ValueError('Small file')
-                    uploaded = await Parallel(sender,cfg['connections']).upload(path)
+                    uploaded = await Parallel(sender,cfg['connections']).upload(path,progress=progress_for(uid,'upload',path))
                 except (asyncio.CancelledError,FloodWaitError):
                     raise
                 except Exception as exc:
                     log.info('Standard upload fallback: %s',type(exc).__name__)
-                    uploaded = await retry(sender.upload_file,path)
+                    uploaded = await retry(sender.upload_file,path,progress_callback=progress_for(uid,'upload',path))
                 # upload_media converts per-file attributes and thumbnails into album-capable media.
                 attrs = [copy.copy(a) for a in (getattr(m.document,'attributes',[]) if m.document else [])]
                 for attr in attrs:
@@ -391,12 +458,36 @@ async def send_prepared(uid,item,cfg,sender,dest,topic):
         await send_media(sender,dest,uploads,[caption(m,cfg,item['index'])[0] for m,p in item['files']],
                          [caption(m,cfg,item['index'])[1] for m,p in item['files']],topic)
         return len(item['files'])
+    count=0
     for m,(text,entities) in zip(msgs,texts):
-        if m.poll:
-            raise ValueError('Poll cloning is not supported by Telegram bot sessions; use User sender + forward mode')
-        if text:
-            await retry(sender.send_message,dest,text,formatting_entities=entities,parse_mode=None,reply_to=topic,link_preview=False)
-    return len(msgs)
+        count+=await send_nonfile(sender,dest,m,text,entities,topic)
+    return count
+
+
+def save_job_checkpoint(uid,links,cfg,start,topic_map):
+    job=JOBS[uid]
+    stats={k:job.get(k,0) for k in ('ok','skipped','failed','polls','server_copies')}
+    DB.set(uid,'pending_job',dict(links=links,cfg=cfg,start=start,topic_map=topic_map,stats=stats))
+
+
+def record_failure(uid,src,mid,cfg,exc):
+    rows=DB.get(uid,'failed_items',[]) or []
+    target=str(cfg.get('target') or uid)
+    rows=[r for r in rows if not (str(r['src'])==str(src) and r['mid']==mid and r['target']==target and (r.get('topic') or None)==(cfg.get('topic') or None) and r.get('sender','Bot')==cfg.get('sender','Bot'))]
+    rows.append(dict(src=str(src),mid=mid,target=target,topic=cfg.get('topic') or None,sender=cfg.get('sender','Bot'),error=type(exc).__name__+': '+str(exc)[:250],time=time.time()))
+    DB.set(uid,'failed_items',rows[-500:])
+
+
+def forget_failure(uid,src,ids,cfg):
+    rows=DB.get(uid,'failed_items',[]) or []
+    filtered=[r for r in rows if not (str(r['src'])==str(src) and r['mid'] in ids and r['target']==str(cfg.get('target') or uid) and (r.get('topic') or None)==(cfg.get('topic') or None) and r.get('sender','Bot')==cfg.get('sender','Bot'))]
+    if len(rows)!=len(filtered):DB.set(uid,'failed_items',filtered)
+
+
+async def card_loop(uid,job):
+    while JOBS.get(uid) is job:
+        await update_card(uid)
+        await asyncio.sleep(5)
 
 
 async def run_job(uid,links,cfg=None,start=0,topic_map=None):
@@ -404,85 +495,115 @@ async def run_job(uid,links,cfg=None,start=0,topic_map=None):
     job = JOBS[uid]
     folder = ROOT/f'u_{uid}_{job["id"]}'
     pending_tasks = {}
+    gates={start:asyncio.Event()};gates[start].set()
     seen = set()
+    updater=asyncio.create_task(card_loop(uid,job))
     try:
         await durable_flush(critical=True)
         sender,dest,default_topic = await destination_entity(uid,cfg)
         workers = max(1,min(5,int(cfg['workers'])))
         async with lock(uid):
             for i in range(start,len(links)):
-                if job['cancel']:
-                    break
+                if job['cancel']:break
                 for j in range(i,min(i+workers,len(links))):
                     if j not in pending_tasks:
-                        src,mid = links[j]
-                        pending_tasks[j] = asyncio.create_task(prepare(uid,src,mid,cfg,j+1,folder/str(j),seen))
-                task = pending_tasks.pop(i)
-                # Keep a reference so cancellation also joins an in-flight preparation.
-                job['preparing'] = task
-                item = await task
-                job.pop('preparing',None)
-                topic = default_topic
-                if topic_map and not item.get('skip'):
-                    topic = topic_map.get(str(topic_id(item['msgs'][0])),default_topic)
-                n = await send_prepared(uid,item,cfg,sender,dest,topic)
-                job['ok'] += n
-                DB.success(uid,n)
-                job['done'] = i+1
-                DB.set(uid,'pending_job',dict(links=links,cfg=cfg,start=i+1,topic_map=topic_map))
-                shutil.rmtree(folder/str(i),ignore_errors=True)
-                if time.time()-job['updated'] > 5:
-                    await update_card(uid)
-                await asyncio.sleep(max(0.1,float(cfg['delay'])))
+                        src,mid=links[j]
+                        before=gates.setdefault(j,asyncio.Event())
+                        after=gates.setdefault(j+1,asyncio.Event())
+                        pending_tasks[j]=asyncio.create_task(prepare(uid,src,mid,cfg,j+1,folder/str(j),seen,admission=(before,after)))
+                task=pending_tasks.pop(i)
+                job['preparing']=task
+                item=None
+                src,mid=links[i]
+                try:
+                    item=await task
+                    topic=default_topic
+                    if topic_map and not item.get('skip'):
+                        topic=topic_map.get(str(topic_id(item['msgs'][0])),default_topic)
+                    n=await send_prepared(uid,item,cfg,sender,dest,topic)
+                    job['ok']+=n
+                    if not n:job['skipped']=job.get('skipped',0)+1
+                    DB.success(uid,n)
+                    if n:forget_failure(uid,src,item.get('ids',[mid]),cfg)
+                except Exception as exc:
+                    if not nonfatal(exc):raise
+                    job['failed']=job.get('failed',0)+1
+                    record_failure(uid,src,mid,cfg,exc)
+                    log.warning('Content item recorded uid=%s mid=%s kind=%s; queue continuing',uid,mid,type(exc).__name__)
+                finally:
+                    job.pop('preparing',None)
+                    gates[i+1].set()
+                job['done']=i+1
+                job['processed_run']=job.get('processed_run',0)+1
+                save_job_checkpoint(uid,links,cfg,i+1,topic_map)
+                await cleanup_files(folder/str(i))
+                gates.pop(i,None)
+                await asyncio.sleep(max(.1,float(cfg['delay'])))
         if not job['cancel']:
             DB.set(uid,'pending_job',None)
-            job['state'] = 'Complete'
-        else:
-            job['state'] = 'Stopped; /resume available'
+            job['state']='Complete' if not job.get('failed') else 'Complete with failed items — /failed'
+        else:job['state']='Stopped; /resume available'
     except asyncio.CancelledError:
-        job['state'] = 'Stopped; /resume available'
+        job['state']='Stopped; /resume available'
     except Exception as exc:
         if RECOVERY and isinstance(exc,AUTH_ERRORS+(LoginRequired,)):
             RECOVERY.state[uid]={'state':'revoked','error':type(exc).__name__}
-        job['state'] = 'Failed: '+type(exc).__name__
-        await notify(uid,'Transfer paused: '+str(exc)[:400]+'\nFix settings, then /resume. Telegram permissions still apply.')
+        job['state']='Paused: '+type(exc).__name__
+        await notify(uid,'Transfer paused: '+str(exc)[:400]+'\nCheckpoint retained. /resume applies changed transport/filter settings; /resume latest uses all current settings. Support: @SyntaxError_2',buttons=support_buttons())
     finally:
-        for t in list(pending_tasks.values())+[job.get('preparing')]:
-            if t and not t.done():
-                t.cancel()
-        await asyncio.gather(*(t for t in list(pending_tasks.values())+[job.get('preparing')] if t),return_exceptions=True)
-        shutil.rmtree(folder,ignore_errors=True)
+        tasks=list(pending_tasks.values())+[job.get('preparing')]
+        for t in tasks:
+            if t and not t.done():t.cancel()
+        await asyncio.gather(*(t for t in tasks if t),return_exceptions=True)
+        updater.cancel();await asyncio.gather(updater,return_exceptions=True)
+        await cleanup_files(folder)
+        DB.set(uid,'last_job_summary',{k:job.get(k,0) for k in ('ok','skipped','failed','polls','done','total','server_copies','download_bytes','upload_bytes')})
         await update_card(uid,final=True)
         JOBS.pop(uid,None)
+        await durable_flush(critical=True)
 
 
 async def update_card(uid,final=False):
-    job = JOBS.get(uid)
-    if not job:
-        return
-    job['updated'] = time.time()
-    elapsed = max(1,time.time()-job['started'])
-    text = f"⚡ V6 Transfer — {job['state']}\nProcessed: {job['done']}/{job['total']}\nMessages sent: {job['ok']}\nElapsed: {elapsed:.1f}s | {job['ok']/elapsed:.2f} msg/s\n/status · /stop · /resume"
+    job=JOBS.get(uid)
+    if not job:return
+    job['updated']=time.time()
+    elapsed=max(1,time.time()-job['started'])
+    run_sent=job['ok']-job.get('base_ok',0)
+    down=job.get('download_bytes',0)/1048576;up=job.get('upload_bytes',0)/1048576
+    text=(f"⚡ V{VERSION} TRANSFER — {job['state']}\n━━━━━━━━━━━━━━━━━━━━\n\n"
+          f"Queue cursor: {job['done']}/{job['total']}\nProcessed this run: {job.get('processed_run',0)}\n"
+          f"Messages sent (known cumulative): {job['ok']}\nSent this run: {run_sent}\n"
+          f"Skipped/filtered units: {job.get('skipped',0)} | Failed: {job.get('failed',0)}\n"
+          f"Polls archived as text: {job.get('polls',0)}\nServer-side copies: {job.get('server_copies',0)}\n\n"
+          f"Downloaded: {down:.1f} MiB | Uploaded: {up:.1f} MiB\n"
+          f"Average I/O this run: {(down+up)/elapsed:.2f} MiB/s\n"
+          f"Latest I/O: {job.get('phase','Preparing / waiting for capacity')}\n"
+          f"Elapsed: {elapsed:.1f}s | {run_sent/elapsed:.2f} sent msg/s\n\n/status · /stop · /resume · /failed")
     try:
         if job.get('card'):
             await job['card'].edit(text,parse_mode=None,buttons=None if final else [[Button.inline('⏹ Stop my job',b'stopjob')]])
-    except Exception:
-        pass
+    except Exception:pass
 
 
-async def start_job(e,links,cfg=None,start=0,topic_map=None):
-    uid = e.sender_id
-    if uid in JOBS:
-        return await respond(e,'Your job is already running. /stop first.')
-    if not links or len(links)>10000:
-        raise ValueError('Choose between 1 and 10,000 posts')
-    complete_cfg = cfg_for(uid)
-    complete_cfg.update(cfg or {})
-    cfg = complete_cfg
-    card = await respond(e,'⚡ Validating your destination and starting your isolated queue…')
-    JOBS[uid] = dict(id=uuid.uuid4().hex[:12],ok=0,done=start,total=len(links),cancel=False,started=time.time(),updated=0,state='Running',card=card)
-    DB.set(uid,'pending_job',dict(links=links,cfg=cfg,start=start,topic_map=topic_map))
-    JOBS[uid]['task'] = spawn(run_job(uid,links,cfg,start,topic_map))
+async def start_job(e,links,cfg=None,start=0,topic_map=None,stats=None):
+    async with JOB_START_LOCKS.setdefault(e.sender_id,asyncio.Lock()):
+        return await start_job_locked(e,links,cfg,start,topic_map,stats)
+
+
+async def start_job_locked(e,links,cfg=None,start=0,topic_map=None,stats=None):
+    uid=e.sender_id
+    if uid in JOBS:return await respond(e,'Your job is already running. /stop first.')
+    if not links or len(links)>10000:raise ValueError('Choose between 1 and 10,000 posts')
+    complete_cfg=cfg_for(uid);complete_cfg.update(cfg or {});cfg=complete_cfg
+    cfg['_settings_baseline']={k:DB.get(uid,k) for k in ('sender','mode','workers','connections','delay','filter','type_filters')}
+    card=await respond(e,'⚡ Starting your ordered queue. Polls will be archived as text where native forwarding is unavailable. Live byte counters update during large transfers.')
+    stats=stats or {}
+    JOBS[uid]=dict(id=uuid.uuid4().hex[:12],ok=int(stats.get('ok',0)),base_ok=int(stats.get('ok',0)),
+        skipped=int(stats.get('skipped',0)),failed=int(stats.get('failed',0)),polls=int(stats.get('polls',0)),server_copies=int(stats.get('server_copies',0)),
+        done=start,total=len(links),cancel=False,started=time.time(),updated=0,state='Running',card=card,processed_run=0)
+    cfg['_job_id']=JOBS[uid]['id']
+    save_job_checkpoint(uid,links,cfg,start,topic_map)
+    JOBS[uid]['task']=spawn(run_job(uid,links,cfg,start,topic_map))
 
 
 async def stop_job(uid):
@@ -601,8 +722,16 @@ async def drain_watch(uid,rid):
                     save_route(uid,route)
                     continue
                 cfg['_delivered_ids']=recent
-                item = await prepare(uid,route['src'],m.id,cfg,m.id,folder/str(m.id),seen)
-                n = await send_prepared(uid,item,cfg,sender,dest,topic)
+                try:
+                    item = await prepare(uid,route['src'],m.id,cfg,m.id,folder/str(m.id),seen)
+                    n = await send_prepared(uid,item,cfg,sender,dest,topic)
+                    if n:forget_failure(uid,route['src'],item.get('ids',[m.id]),cfg)
+                except Exception as exc:
+                    if not nonfatal(exc):raise
+                    record_failure(uid,route['src'],m.id,cfg,exc)
+                    route['item_failures']=route.get('item_failures',0)+1
+                    route['last_item_error']=type(exc).__name__+': '+str(exc)[:100]
+                    item={'ids':[m.id]};n=0
                 DB.success(uid,n)
                 # Advance through the iterator, not max(album IDs): interleaved posts must not be skipped.
                 route['last'] = m.id
@@ -611,7 +740,7 @@ async def drain_watch(uid,rid):
                 route.update(failures=0,retry_at=0,flood_until=0,last_success=time.time())
                 if not save_route(uid,route):
                     break
-                shutil.rmtree(folder,ignore_errors=True)
+                await cleanup_files(folder)
                 await asyncio.sleep(max(.1,float(cfg['delay'])))
     except asyncio.CancelledError:
         raise
@@ -635,7 +764,7 @@ async def drain_watch(uid,rid):
             if should_notify:
                 await notify(uid,f"Watch {rid} waiting: {route['error']}\nAutomatic retry in {delay}s. Cursor was NOT skipped.\n/watchlist to inspect. Support: @SyntaxError_2",buttons=support_buttons())
     finally:
-        shutil.rmtree(folder,ignore_errors=True)
+        await cleanup_files(folder)
         WATCH_TASKS.pop((uid,rid),None)
 
 
@@ -698,6 +827,7 @@ def menu():
     return [[Button.inline('🔐 My login',b'menu_login'),Button.inline('⚡ Forward',b'menu_forward')],
             [Button.inline('🔴 Auto-Forward',b'menu_watch'),Button.inline('⚙ My settings',b'menu_settings')],
             [Button.inline('📊 My status',b'menu_status'),Button.inline('❓ Commands',b'menu_help')],
+            [Button.inline('⚡ Speed profile',b'menu_fast'),Button.inline('📄 Failed items',b'menu_failed')],
             [Button.url('🆘 Support • @SyntaxError_2',SUPPORT_URL)]]
 
 HELP = help_page('home')[0]  # compatibility for tooling; command pages are served dynamically
@@ -888,7 +1018,7 @@ async def watch_view(e,page=0):
     text+=f'\nPage {page+1} • Routes: {len(routes)}\n'
     buttons = []
     for r in routes[page*5:(page+1)*5]:
-        text += f"\n{'⏸ PAUSED' if r.get('paused') else '🟢 ACTIVE'} • {r['id']}\n\nSource: {r['src']}\nDestination: {r['target']}\nLast confirmed ID: {r.get('last')}\nStatus: {r.get('error') or 'OK'}\n━━━━━━━━━━━━━━━━━━━━\n"
+        text += f"\n{'⏸ PAUSED' if r.get('paused') else '🟢 ACTIVE'} • {r['id']}\n\nSource: {r['src']}\nDestination: {r['target']}\nLast confirmed ID: {r.get('last')}\nStatus: {r.get('error') or 'OK'}\nRecorded content failures: {r.get('item_failures',0)} (/failed)\n━━━━━━━━━━━━━━━━━━━━\n"
         buttons.append([Button.inline('Resume' if r.get('paused') else 'Pause',('watch_toggle_'+r['id']).encode()),Button.inline('Retry now',('watch_retry_'+r['id']).encode()),Button.inline('Delete '+r['id'],('watch_del_'+r['id']).encode())])
     nav=[]
     if page:nav.append(Button.inline('← Previous',f'watchpage_{page-1}'.encode()))
@@ -1072,14 +1202,32 @@ async def command(e,cmd,arg):
         await stop_job(uid)
         return await respond(e,'Your job/panel/login stopped. /resume keeps the last confirmed checkpoint. Live routes: /watchlist to pause.')
     if cmd == 'resume':
-        pending = DB.get(uid,'pending_job')
-        if not pending:
-            raise ValueError('No pending job')
-        saved_cfg = dict(pending.get('cfg') or {})
+        pending=DB.get(uid,'pending_job')
+        if not pending:raise ValueError('No pending job')
+        if arg not in ('','latest'):raise ValueError('Use /resume or /resume latest')
+        saved_cfg=dict(pending.get('cfg') or {})
         for key in ('target','mode','caption'):
-            if key in pending and key not in saved_cfg:
-                saved_cfg[key] = pending[key]
-        return await start_job(e,pending['links'],saved_cfg,pending.get('start',pending.get('idx',0)),pending.get('topic_map'))
+            if key in pending and key not in saved_cfg:saved_cfg[key]=pending[key]
+        if arg=='latest':saved_cfg=cfg_for(uid)
+        else:
+            baseline=saved_cfg.get('_settings_baseline')
+            for key in ('sender','mode','workers','connections','delay','filter','type_filters'):
+                current=DB.get(uid,key)
+                if baseline is None or current!=baseline.get(key):saved_cfg[key]=current
+        return await start_job(e,pending['links'],saved_cfg,pending.get('start',pending.get('idx',0)),pending.get('topic_map'),stats=pending.get('stats'))
+    if cmd == 'fast':
+        return await respond(e,'⚡ FAST PROFILE — choose deliberately\n\nUser sender can reuse Telegram media server-side when your account has source + destination access and copying is allowed. Large file size then need not consume Render download/upload bandwidth.\n\nWith your private default destination, USER sender writes to Saved Messages, NOT this bot chat. Channel/group destinations remain the selected channel/group.\n\nRestricted/renamed/custom-thumbnail media may still require full download + upload. This cannot bypass permissions, flood waits or hosting limits. No 2-hour guarantee.\n\nThis changes future transfers. For a paused job, /resume applies changed transport settings.',[[Button.inline('Enable User sender fast profile',b'speed_user')],[Button.inline('Keep Bot sender (safe current destination)',b'speed_bot')],[Button.inline('Cancel',b'nav_home')]])
+    if cmd == 'failed':
+        rows=DB.get(uid,'failed_items',[]) or []
+        if not rows:return await respond(e,'No recorded content-item failures. Global permission/network failures pause at their checkpoint instead.')
+        text='Your recorded content failures (latest 500 maximum):\n\n'+'\n\n'.join(f"{r['src']} / {r['mid']} → {r['target']} (topic {r.get('topic')}, sender {r.get('sender','Bot')})\n{r['error']}" for r in rows)
+        file=io.BytesIO(text.encode());file.name='my_failed_items.txt'
+        return await BOT.send_file(uid,file,caption='Content failures are retained for retry. /retryfailed uses your current destination/settings.',parse_mode=None)
+    if cmd == 'retryfailed':
+        cfg=cfg_for(uid)
+        rows=[r for r in (DB.get(uid,'failed_items',[]) or []) if r['target']==str(cfg.get('target') or uid) and (r.get('topic') or None)==(cfg.get('topic') or None) and r.get('sender','Bot')==cfg.get('sender','Bot')]
+        if not rows:raise ValueError('No failed items matching your current destination, topic and sender. /failed to inspect others.')
+        return await start_job(e,list(dict.fromkeys((r['src'],r['mid']) for r in rows)),cfg)
     if cmd == 'discard':
         if uid in JOBS:
             raise ValueError('/stop before discarding')
@@ -1186,7 +1334,7 @@ async def command(e,cmd,arg):
 
 
 ADMIN_COMMANDS = {'admin','users','broadcast','ban','unban','approve','alljobs','access','backup','restore'}
-COMMANDS = set('start help support id login reconnect cancellogin logout session exportsession chats dialogs join forward publicforward save batch grouptransfer bottransfer cancel stop resume discard watch watchlist unwatch settarget setchannel setmode setfilter settypes setworkers setconnections setdelay setpoll setcaption clearcaption clearreplace replace replaces settings reset status stats myplan dyno_status ping cleanup_ram'.split()) | ADMIN_COMMANDS
+COMMANDS = set('start help fast failed retryfailed support id login reconnect cancellogin logout session exportsession chats dialogs join forward publicforward save batch grouptransfer bottransfer cancel stop resume discard watch watchlist unwatch settarget setchannel setmode setfilter settypes setworkers setconnections setdelay setpoll setcaption clearcaption clearreplace replace replaces settings reset status stats myplan dyno_status ping cleanup_ram'.split()) | ADMIN_COMMANDS
 
 
 async def admin(e,cmd,arg):
@@ -1261,6 +1409,20 @@ async def callbacks(e):
         control_ui.CONFIRM.clear()
     if data.startswith('watchpage_'):
         return await watch_view(e,int(data[10:]))
+    if data in ('speed_user','speed_bot'):
+        if uid in JOBS:raise ValueError('/stop your current job before changing its speed profile, then /resume')
+        cfg=cfg_for(uid)
+        cfg.update(sender='User' if data=='speed_user' else 'Bot',mode='copy',workers=2,connections=4,delay=.1)
+        if data=='speed_user':await ensure_session(uid)
+        await destination_entity(uid,cfg)
+        for key in ('sender','mode','workers','connections','delay'):DB.set(uid,key,cfg[key])
+        pending=DB.get(uid,'pending_job')
+        if pending:
+            pending_cfg=dict(pending.get('cfg') or {})
+            pending_cfg.update({key:cfg[key] for key in ('sender','mode','workers','connections','delay')})
+            pending['cfg']=pending_cfg;DB.set(uid,'pending_job',pending)
+        await durable_flush(critical=True)
+        return await respond(e,'✅ Profile saved: '+cfg['sender']+' sender, copy mode, 2 workers, 4 connections.\nExisting paused job: /resume. Native reuse only when Telegram permits it. Polls do not block the queue.',menu())
     if data.startswith('help_'):
         text,buttons=help_page(data[5:],owner=uid==OWNER_ID)
         return await respond(e,text,buttons)
@@ -1273,7 +1435,7 @@ async def callbacks(e):
         if action == 'watch':
             PANELS[uid] = dict(step='watch')
             return await respond(e,'Send source and optional destination:\n@source @dest:topic\nA post link or -100… ID also works. /cancel')
-        return await command(e,{'login':'login','forward':'forward','settings':'settings','status':'status','help':'help','support':'support'}.get(action,'help'),'')
+        return await command(e,{'login':'login','forward':'forward','settings':'settings','status':'status','help':'help','support':'support','fast':'fast','failed':'failed'}.get(action,'help'),'')
     if data == 'stopjob':
         await stop_job(uid)
         return await respond(e,'Your transfer stopped; /resume available.')
@@ -1561,7 +1723,7 @@ async def migrate_routes(uid):
 
 
 async def main():
-    global BOT,DB,TRANSFER_LIMIT,USERNAME,STOPPING,CHECKPOINTS,RECOVERY,SESSION_HANDOFF
+    global BOT,DB,TRANSFER_LIMIT,USERNAME,STOPPING,CHECKPOINTS,RECOVERY,SESSION_HANDOFF,DISK
     if not API_ID or not API_HASH or not BOT_TOKEN:
         raise RuntimeError('API_ID, API_HASH and BOT_TOKEN are required')
     SESSION_HANDOFF=asyncio.Event()
@@ -1580,6 +1742,7 @@ async def main():
     DB.global_set('broadcast_active',False)
     RECOVERY=SessionRecovery(DB,USER_CLIENTS,connect_user)
     TRANSFER_LIMIT = asyncio.Semaphore(int(os.getenv('GLOBAL_TRANSFERS','2')))
+    DISK=DiskBudget(ROOT,DISK_BUDGET)
     bot_session = StringSession()
     if os.getenv('BOT_DC_ID') and os.getenv('BOT_DC_IP'):
         bot_session.set_dc(int(os.environ['BOT_DC_ID']),os.environ['BOT_DC_IP'],443)

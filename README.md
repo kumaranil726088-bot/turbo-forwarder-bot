@@ -141,3 +141,39 @@ curl https://YOUR-SERVICE/health
 Optional `RUN_TRANSPORT_SELFTEST=1`: after startup reuse the bot session to upload a small temporary file to the owner, download it through three parallel senders, verify SHA-256 and delete the Telegram message/local files. Logs state `TRANSPORT_SELFTEST PASS` or `FAIL`. This does not test membership in any user's private channel, video streaming playback or end-to-end live routes. Test those with authorized source/destination accounts.
 
 HTTP `/` and `/health` bind `0.0.0.0:$PORT`. A self-request is best-effort only and cannot guarantee Render free-tier uptime. Session/OTP/password values are not intentionally logged. Limits are configurable in `.env.example`; consider abuse/resource controls before promoting an open deployment publicly.
+
+## V6.3 — ordered queue, poll recovery and visible I/O
+
+- Polls use native forwarding when eligible and explicitly requested; otherwise a
+  clearly labelled, non-interactive text archive preserves question/options and
+  available vote totals. Hidden quiz answers/votes are not cloned. Long archives
+  are split by Telegram UTF-16 message limits.
+- `/resume` keeps the paused job's destination/customizations and applies changed
+  sender/mode/workers/connections/delay/filter/type settings. Legacy checkpoints
+  use the current transport/filter settings. `/resume latest` explicitly uses all
+  current settings, including destination and caption.
+- `/failed` exports your latest 500 recorded content failures. `/retryfailed`
+  matches current destination, topic **and sender**; filtered/missing items do not
+  clear a failure record. Global permission/auth/network/disk failures still pause
+  without advancing the failed cursor. Sending and checkpointing are not atomic.
+- Ordered prefetch reserves bounded temporary disk outside transfer slots. A
+  cached/native candidate holds later admission until its extraction fallback is
+  resolved, preventing later downloads from consuming its required disk. Workers
+  pipeline downloads with sending; they do not reorder destination posts.
+- Every five seconds the status card shows cumulative sent, this-run sent,
+  skipped/failed units, archived polls, native media copies, and download/upload
+  callback bytes. Retry traffic is counted where callbacks report it. These are
+  payload callback counters, not a network-interface benchmark; average I/O sums
+  download + upload over this run's elapsed time. Albums contain multiple messages.
+- `/fast` requires explicit User/Bot sender selection; it is not an automatic
+  permission bypass. User sender + private default destination means **Saved
+  Messages**, not this bot DM. Source/destination access and Telegram restrictions
+  still apply. Restricted, renamed or custom-thumbnail files may need full I/O.
+- Parallel MTProto connections initialize concurrently with all-started sender
+  cleanup on failure/cancellation. FloodWait is honored. No free-host throughput,
+  uptime or “2,000 × 900 MB in two hours” guarantee.
+
+Validation: 121 automated tests, including 23 queue/connection regressions; live
+bot-account poll archive + following-message check; 3-connection upload/download
+SHA256 check; 2-sender cross-DC authorization check. Temporary live test messages
+were deleted. No live private-user account or 900 MB throughput certification.

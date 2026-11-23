@@ -68,6 +68,8 @@ Neeche category select karein. Har page par commands aur examples milenge.
 
 📎 UTF-8 TXT file bhejein: har line mein link/range. Maximum 512 KiB; maximum 10,000 posts/job.
 
+🗳 Polls: native-forward eligible ho to original forward; otherwise clearly labelled text archive. Votes/hidden quiz answers clone nahi hote. Ek poll video queue nahi rokta.
+
 ✨ Panel options
    Promo • Caption • Rename • Hyperlink • Uploaded thumbnail • Topic • Sender.
 
@@ -82,7 +84,16 @@ Rename: old|new, ya Lesson_{index}. Caption: {original}, {index}, {title}.'''),
    Apna job, panel aur login flow cancel karein. Live routes alag hain.
 
 /resume
-   Last confirmed checkpoint se pending transfer resume karein.
+   Last confirmed checkpoint se resume karein; changed transport/filter settings apply hote hain. Job destination/custom captions retained.
+
+/resume latest
+   ALL current settings use karein, including current destination/caption.
+
+/failed
+   Recorded content failures ki TXT list. Maximum latest 500 retained.
+
+/retryfailed
+   Current destination ke failed items retry karein.
 
 /discard
    Stopped job ka resume checkpoint delete karein.
@@ -125,6 +136,9 @@ Naya route latest post se start hota hai. Pause/resume stored cursor se backlog 
 
 /id
    Current chat/message/topic ID dekhein. Groups mein /id@BotUsername bhi supported hai.
+
+/fast
+   User/Bot sender profile choose karein. User sender + own private default destination means Saved Messages, not this bot DM. Restricted content still requires permitted extraction.
 
 /setmode turbo
    Options: turbo, copy, download, forward. Native forwarding same session aur allowed source par hi hoti hai.
@@ -250,7 +264,7 @@ SLASH_MENU = [
 ('start','🏠 Main menu and quick start'),('help','📖 Category-wise command guide'),('support','🆘 Contact @SyntaxError_2 for help'),
 ('forward','📤 Private transfer settings panel'),('publicforward','🌐 Public-source transfer panel'),
 ('watchlist','🔴 Manage automatic routes'),('watch','➕ Add a live source/destination route'),
-('unwatch','🗑 Remove a live route'),('status','📊 My current transfer status'),
+('unwatch','🗑 Remove a live route'),('status','📊 My current transfer status'),('fast','⚡ Choose a verified fast sender profile'),('failed','📄 My recorded failed content items'),('retryfailed','🔄 Retry failures for current destination'),
 ('stop','⏹ Stop my transfer; keep checkpoint'),('resume','▶ Resume my pending transfer'),
 ('cancel','✖ Cancel my job or input flow'),('discard','🗑 Delete my resume checkpoint'),
 ('save','🔗 Transfer post links or ranges'),('batch','📚 Transfer first-to-last message range'),
