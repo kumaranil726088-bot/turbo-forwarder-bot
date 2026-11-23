@@ -137,6 +137,9 @@ Naya route latest post se start hota hai. Pause/resume stored cursor se backlog 
 /id
    Current chat/message/topic ID dekhein. Groups mein /id@BotUsername bhi supported hai.
 
+/why <post link>
+   Read-only transfer-path check: source/sender mismatch, protection, rename/thumb, current destination. No file downloaded/sent.
+
 /fast
    User/Bot sender profile choose karein. User sender + own private default destination means Saved Messages, not this bot DM. Restricted content still requires permitted extraction.
 
@@ -264,7 +267,7 @@ SLASH_MENU = [
 ('start','🏠 Main menu and quick start'),('help','📖 Category-wise command guide'),('support','🆘 Contact @SyntaxError_2 for help'),
 ('forward','📤 Private transfer settings panel'),('publicforward','🌐 Public-source transfer panel'),
 ('watchlist','🔴 Manage automatic routes'),('watch','➕ Add a live source/destination route'),
-('unwatch','🗑 Remove a live route'),('status','📊 My current transfer status'),('fast','⚡ Choose a verified fast sender profile'),('failed','📄 My recorded failed content items'),('retryfailed','🔄 Retry failures for current destination'),
+('unwatch','🗑 Remove a live route'),('status','📊 My current transfer status'),('why','🔎 Explain transfer path for a post link'),('fast','⚡ Choose a fast sender profile'),('failed','📄 My recorded failed content items'),('retryfailed','🔄 Retry failures for current destination'),
 ('stop','⏹ Stop my transfer; keep checkpoint'),('resume','▶ Resume my pending transfer'),
 ('cancel','✖ Cancel my job or input flow'),('discard','🗑 Delete my resume checkpoint'),
 ('save','🔗 Transfer post links or ranges'),('batch','📚 Transfer first-to-last message range'),

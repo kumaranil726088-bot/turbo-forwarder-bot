@@ -177,3 +177,42 @@ Validation: 121 automated tests, including 23 queue/connection regressions; live
 bot-account poll archive + following-message check; 3-connection upload/download
 SHA256 check; 2-sender cross-DC authorization check. Temporary live test messages
 were deleted. No live private-user account or 900 MB throughput certification.
+
+## V6.4 — warm transports and path diagnostics
+
+- `/why <one post link>` performs a read-only metadata/access preflight against
+  your current settings/destination. It downloads no file and sends no copied
+  content. It explains same-session native candidates, account mismatch, source
+  protection, download mode, rename/custom-thumbnail requirements. A preflight is
+  not an actual send test and cannot guarantee Telegram acceptance.
+- Native expired/invalid media references get one metadata refresh + native retry
+  before extraction fallback, avoiding a needless full reupload on that error.
+  Disappeared content is recorded; newly protected messages are not natively reused.
+- Healthy MTProto sender sets can be reused. The **global** cache has at most
+  GLOBAL_TRANSFERS entries (default 2), each at most 6 sockets. Leases are exclusive,
+  keyed by exact Telegram client instance, data center and connection count. No
+  cross-account access hashes/keys, copied messages, or session secrets are saved
+  in database settings by this cache. Failed/cancelled operations discard their
+  connection entry. Logout/replacement retires that account's entries; shutdown
+  closes the cache. Idle entries expire on next acquisition after 30 seconds.
+- For a new remote DC pool, one export/import pair is serialized using Telethon's
+  borrowed-sender lock. Followers connect concurrently using a copy of that DC's
+  authorized key rather than racing several one-use authorization imports.
+- Per-job/watch-drain metadata cache coalesces source lookups, bounded to 128
+  source/client pairs and 30-second TTL. Telegram enforces permissions on actual
+  reads/sends. Runtime transport/cache objects are never checkpointed.
+- Existing sender/destination/settings remain unchanged. No silent switch from
+  Bot DM to User Saved Messages. `/fast` is still an explicit choice. Authorized
+  protected-source extraction still needs payload download/upload, and any denial
+  remains visible. Existing default extraction cap remains 1900 MiB; native copies
+  do not use local download capacity. This is NOT a promise of all 2GB files being
+  reuploaded on the existing free host.
+
+Validation: 147 tests pass. Live sandbox bot-account checks: native media copy
+without invoking the downloader; two pooled uploads/downloads with SHA256 match;
+three-sender DC2 and DC4 cold/warm initialization. An initial multi-export remote
+DC test failed with AuthBytesInvalidError; the single-export initialization fix
+passed subsequent DC2/DC4 checks. Small ~1MiB upload sample was 2.87s cold / 1.58s
+warm. That sample isolates setup overhead and is NOT a 2GB, private-user-account,
+production, or sustained-throughput benchmark. All three temporary test messages
+were removed. No rate-limit bypass, unlimited-storage, uptime or accuracy guarantee.

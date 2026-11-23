@@ -1,4 +1,4 @@
-"""Turbo Forwarder V6.2 — saved-session recovery and resilient private watches.
+"""Turbo Forwarder V6.4 — scoped warm transports and explainable transfer paths.
 Use only for content you are authorized to copy. Telegram permissions still apply.
 """
 import asyncio
@@ -36,12 +36,14 @@ from help_ui import help_page, SLASH_MENU, OWNER_MENU
 from remote_state import GitState, Checkpoints, StateConflict
 from sessions import SessionRecovery, LoginRequired, SessionUnavailable, AUTH_ERRORS
 from storage import Store, DEFAULTS
+from transport_pool import ACTIVE_POOL, ConnectionPool
+from speed_tools import ACTIVE_METADATA, MetadataCache, transfer_plan
 from transfer import Parallel, TYPES, parse_links, parse_post_link, source_ref, destination, msg_type, topic_id, renamed, retry
 
 from dotenv import load_dotenv
 load_dotenv()
 
-VERSION = '6.3'
+VERSION = '6.4'
 START = time.time()
 API_ID = int(os.getenv('API_ID','0'))
 API_HASH = os.getenv('API_HASH','')
@@ -67,6 +69,7 @@ WATCH_TASKS = {}
 USER_LOCKS = {}
 BACKGROUND = set()
 TRANSFER_LIMIT = None
+TRANSPORTS = None
 DISK = None
 JOB_START_LOCKS = {}
 USERNAME = ''
@@ -300,7 +303,8 @@ async def prepare(uid,src,mid,cfg,index,folder,seen,admission=None):
 
 async def prepare_core(uid,src,mid,cfg,index,folder,seen,next_admission=None):
     cl = await fetcher(uid,src)
-    source = await entity(cl,src)
+    cache=ACTIVE_METADATA.get()
+    source=await cache.get((cl,str(src)),lambda:entity(cl,src)) if cache else await entity(cl,src)
     group = await messages_group(cl,source,mid)
     if not group:
         if next_admission:next_admission.set()
@@ -316,12 +320,12 @@ async def prepare_core(uid,src,mid,cfg,index,folder,seen,next_admission=None):
     if not group:
         if next_admission:next_admission.set()
         return {'skip':True,'ids':all_ids,'reason':'Album member already handled or filtered'}
-    changed_file = bool(cfg.get('rename') or cfg.get('thumb'))
-    restricted = getattr(source,'noforwards',False) or any(getattr(m,'noforwards',False) for m in group)
     # Files are copied with their original session, not a cross-account access hash.
     sender = USER_CLIENTS.get(uid) if cfg.get('sender') == 'User' else BOT
-    direct = cl is sender and not restricted and not changed_file and cfg['mode'] != 'download'
-    result = dict(cl=cl,source=source,src_ref=src,msgs=group,files=[],thumbs=[],direct=direct,ids=all_ids,index=index,folder=str(folder))
+    direct,reason=transfer_plan(cl,sender,source,group,cfg)
+    job=JOBS.get(uid)
+    if job and cfg.get('_job_id')==job['id']:job['path_reason']=reason
+    result = dict(cl=cl,source=source,src_ref=src,msgs=group,files=[],thumbs=[],direct=direct,ids=all_ids,index=index,folder=str(folder),path_reason=reason)
     if direct or not any(m.file for m in group):
         return result
     size_needed=sum((m.file.size or 8*1024*1024) for m in group if m.file)
@@ -379,10 +383,26 @@ async def send_nonfile(sender,dest,message,text,entities,topic):
     return 0
 
 
+async def refreshed_native_item(item,exc):
+    if type(exc).__name__ not in {'FileReferenceExpiredError','FileReferenceInvalidError'} or item.get('_native_refreshed') or not item.get('cl'):
+        return None
+    ids=[m.id for m in item['msgs']]
+    fresh=await retry(item['cl'].get_messages,item['source'],ids=ids)
+    by_id={m.id:m for m in fresh if m and not getattr(m,'action',None)}
+    if any(mid not in by_id for mid in ids):
+        raise ItemUnavailable('Source media disappeared while refreshing native file references')
+    # Re-read protection flags before retrying. Never reuse newly protected media.
+    if any(getattr(by_id[mid],'noforwards',False) for mid in ids):return None
+    return dict(item,msgs=[by_id[mid] for mid in ids],_native_refreshed=True)
+
+
 async def send_prepared(uid,item,cfg,sender,dest,topic):
     if item.get('skip'):
         return 0
     msgs = item['msgs']
+    job=JOBS.get(uid)
+    if job and cfg.get('_job_id')==job['id']:
+        job['path_reason']=item.get('path_reason','Preparing transfer')
     group = [m for m in msgs if m.file]
     texts = [caption(m,cfg,item['index']) for m in msgs]
     # Native forward only within one session and when there are no customizations.
@@ -396,6 +416,8 @@ async def send_prepared(uid,item,cfg,sender,dest,topic):
             raise
         except Exception as exc:
             if type(exc).__name__ not in {'ChatForwardsRestrictedError','MediaInvalidError','FileReferenceExpiredError','FileReferenceInvalidError'}:raise
+            refreshed=await refreshed_native_item(item,exc)
+            if refreshed is not None:return await send_prepared(uid,refreshed,cfg,sender,dest,topic)
             item['direct'] = False
     if any(m.poll for m in msgs):
         count=0
@@ -422,12 +444,16 @@ async def send_prepared(uid,item,cfg,sender,dest,topic):
             raise
         except Exception as exc:
             if type(exc).__name__ not in {'ChatForwardsRestrictedError','MediaInvalidError','MediaEmptyError','FileReferenceExpiredError','FileReferenceInvalidError'}:raise
+            refreshed=await refreshed_native_item(item,exc)
+            if refreshed is not None:return await send_prepared(uid,refreshed,cfg,sender,dest,topic)
             item['direct'] = False
     if group and not item['files']:
         # Restricted forwarding or cached-media copy rejected. Re-prepare with extraction.
+        if job and cfg.get('_job_id')==job['id']:
+            job['path_reason']='Telegram rejected native reuse; extraction fallback'
         folder = Path(item['folder'])/'fallback' if item.get('folder') else ROOT/f'u_{uid}_{uuid.uuid4().hex[:12]}'
         try:
-            fallback = await prepare(uid,item.get('src_ref',str(utils.get_peer_id(item['source']))),msgs[0].id,dict(cfg,mode='download'),item['index'],folder,set())
+            fallback = await prepare(uid,(item.get('src_ref') or str(utils.get_peer_id(item['source']))),msgs[0].id,dict(cfg,mode='download'),item['index'],folder,set())
             return await send_prepared(uid,fallback,dict(cfg,mode='download'),sender,dest,topic)
         finally:
             await cleanup_files(folder)
@@ -497,6 +523,9 @@ async def run_job(uid,links,cfg=None,start=0,topic_map=None):
     pending_tasks = {}
     gates={start:asyncio.Event()};gates[start].set()
     seen = set()
+    pool=TRANSPORTS or ConnectionPool(capacity=2)
+    pool_token=ACTIVE_POOL.set(pool);metadata_token=ACTIVE_METADATA.set(MetadataCache())
+    job['transport_pool']=pool
     updater=asyncio.create_task(card_loop(uid,job))
     try:
         await durable_flush(critical=True)
@@ -556,6 +585,8 @@ async def run_job(uid,links,cfg=None,start=0,topic_map=None):
             if t and not t.done():t.cancel()
         await asyncio.gather(*(t for t in tasks if t),return_exceptions=True)
         updater.cancel();await asyncio.gather(updater,return_exceptions=True)
+        if pool is not TRANSPORTS:await pool.close()
+        ACTIVE_POOL.reset(pool_token);ACTIVE_METADATA.reset(metadata_token)
         await cleanup_files(folder)
         DB.set(uid,'last_job_summary',{k:job.get(k,0) for k in ('ok','skipped','failed','polls','done','total','server_copies','download_bytes','upload_bytes')})
         await update_card(uid,final=True)
@@ -578,6 +609,8 @@ async def update_card(uid,final=False):
           f"Downloaded: {down:.1f} MiB | Uploaded: {up:.1f} MiB\n"
           f"Average I/O this run: {(down+up)/elapsed:.2f} MiB/s\n"
           f"Latest I/O: {job.get('phase','Preparing / waiting for capacity')}\n"
+          f"Transfer path: {job.get('path_reason','Checking source and destination')}\n"
+          f"Shared warm connection reuses: {job.get('transport_pool').hits if job.get('transport_pool') else 0}\n"
           f"Elapsed: {elapsed:.1f}s | {run_sent/elapsed:.2f} sent msg/s\n\n/status · /stop · /resume · /failed")
     try:
         if job.get('card'):
@@ -639,6 +672,7 @@ async def connect_user(uid,session):
         previous=USER_CLIENTS.get(uid)
         USER_CLIENTS[uid] = cl
         if previous and previous is not cl:
+            if TRANSPORTS:await TRANSPORTS.close_client(previous)
             with contextlib.suppress(Exception):
                 await previous.disconnect()
         async def on_new(event):
@@ -669,6 +703,7 @@ async def disconnect_user(uid,revoke=False):
     await asyncio.gather(*tasks,return_exceptions=True)
     cl = USER_CLIENTS.pop(uid,None)
     if cl:
+        if TRANSPORTS:await TRANSPORTS.close_client(cl)
         if revoke:
             with contextlib.suppress(Exception):
                 await cl.log_out()
@@ -697,6 +732,8 @@ def save_route(uid,route):
 async def drain_watch(uid,rid):
     await asyncio.sleep(0.7)  # album settling; single messages do not wait for polling.
     folder = ROOT/f'u_{uid}_watch_{rid}'
+    pool=TRANSPORTS or ConnectionPool(capacity=2)
+    pool_token=ACTIVE_POOL.set(pool);metadata_token=ACTIVE_METADATA.set(MetadataCache())
     try:
         async with lock(uid):
             routes = DB.get(uid,'watch',[])
@@ -764,6 +801,8 @@ async def drain_watch(uid,rid):
             if should_notify:
                 await notify(uid,f"Watch {rid} waiting: {route['error']}\nAutomatic retry in {delay}s. Cursor was NOT skipped.\n/watchlist to inspect. Support: @SyntaxError_2",buttons=support_buttons())
     finally:
+        if pool is not TRANSPORTS:await pool.close()
+        ACTIVE_POOL.reset(pool_token);ACTIVE_METADATA.reset(metadata_token)
         await cleanup_files(folder)
         WATCH_TASKS.pop((uid,rid),None)
 
@@ -1215,6 +1254,20 @@ async def command(e,cmd,arg):
                 current=DB.get(uid,key)
                 if baseline is None or current!=baseline.get(key):saved_cfg[key]=current
         return await start_job(e,pending['links'],saved_cfg,pending.get('start',pending.get('idx',0)),pending.get('topic_map'),stats=pending.get('stats'))
+    if cmd == 'why':
+        link=parse_post_link(arg)
+        if not link:raise ValueError('/why <one source post link> — checks your current destination/settings; no download or send')
+        cl=await fetcher(uid,link[0]);source=await entity(cl,link[0])
+        messages=await messages_group(cl,source,link[1])
+        if not messages:raise ValueError('Source post is missing or unavailable to your account')
+        cfg=cfg_for(uid);sender,dest,topic=await destination_entity(uid,cfg)
+        direct,reason=transfer_plan(cl,sender,source,messages,cfg)
+        size=sum((m.file.size or 0) for m in messages if m.file)/1048576
+        return await respond(e,'🔎 TRANSFER PATH CHECK (no file download/send)\n\n'+
+            ('Server-side candidate — no full file transfer needed if Telegram accepts it.' if direct else 'Full download + upload may be required.')+
+            '\nReason: '+reason+f"\nSender: {cfg['sender']} | Mode: {cfg['mode']}\nDestination: {cfg.get('target') or uid} | Topic: {topic}\nKnown media size: {size:.1f} MiB"+
+            ('\nUser sender default destination means Saved Messages, NOT this bot DM.' if cfg.get('sender')=='User' and str(cfg.get('target') or uid)==str(uid) else '')+
+            '\n\nRead-only preflight, not a guaranteed send test. Telegram permissions/protection/FloodWait still apply. /fast to choose a sender profile.')
     if cmd == 'fast':
         return await respond(e,'⚡ FAST PROFILE — choose deliberately\n\nUser sender can reuse Telegram media server-side when your account has source + destination access and copying is allowed. Large file size then need not consume Render download/upload bandwidth.\n\nWith your private default destination, USER sender writes to Saved Messages, NOT this bot chat. Channel/group destinations remain the selected channel/group.\n\nRestricted/renamed/custom-thumbnail media may still require full download + upload. This cannot bypass permissions, flood waits or hosting limits. No 2-hour guarantee.\n\nThis changes future transfers. For a paused job, /resume applies changed transport settings.',[[Button.inline('Enable User sender fast profile',b'speed_user')],[Button.inline('Keep Bot sender (safe current destination)',b'speed_bot')],[Button.inline('Cancel',b'nav_home')]])
     if cmd == 'failed':
@@ -1334,7 +1387,7 @@ async def command(e,cmd,arg):
 
 
 ADMIN_COMMANDS = {'admin','users','broadcast','ban','unban','approve','alljobs','access','backup','restore'}
-COMMANDS = set('start help fast failed retryfailed support id login reconnect cancellogin logout session exportsession chats dialogs join forward publicforward save batch grouptransfer bottransfer cancel stop resume discard watch watchlist unwatch settarget setchannel setmode setfilter settypes setworkers setconnections setdelay setpoll setcaption clearcaption clearreplace replace replaces settings reset status stats myplan dyno_status ping cleanup_ram'.split()) | ADMIN_COMMANDS
+COMMANDS = set('start help why fast failed retryfailed support id login reconnect cancellogin logout session exportsession chats dialogs join forward publicforward save batch grouptransfer bottransfer cancel stop resume discard watch watchlist unwatch settarget setchannel setmode setfilter settypes setworkers setconnections setdelay setpoll setcaption clearcaption clearreplace replace replaces settings reset status stats myplan dyno_status ping cleanup_ram'.split()) | ADMIN_COMMANDS
 
 
 async def admin(e,cmd,arg):
@@ -1723,7 +1776,7 @@ async def migrate_routes(uid):
 
 
 async def main():
-    global BOT,DB,TRANSFER_LIMIT,USERNAME,STOPPING,CHECKPOINTS,RECOVERY,SESSION_HANDOFF,DISK
+    global BOT,DB,TRANSFER_LIMIT,USERNAME,STOPPING,CHECKPOINTS,RECOVERY,SESSION_HANDOFF,DISK,TRANSPORTS
     if not API_ID or not API_HASH or not BOT_TOKEN:
         raise RuntimeError('API_ID, API_HASH and BOT_TOKEN are required')
     SESSION_HANDOFF=asyncio.Event()
@@ -1741,7 +1794,9 @@ async def main():
         log.info('Encrypted remote state %s; exclusive checkpoint writer claimed','restored' if restored else 'initialized')
     DB.global_set('broadcast_active',False)
     RECOVERY=SessionRecovery(DB,USER_CLIENTS,connect_user)
-    TRANSFER_LIMIT = asyncio.Semaphore(int(os.getenv('GLOBAL_TRANSFERS','2')))
+    slots=max(1,int(os.getenv('GLOBAL_TRANSFERS','2')))
+    TRANSFER_LIMIT = asyncio.Semaphore(slots)
+    TRANSPORTS=ConnectionPool(capacity=slots)
     DISK=DiskBudget(ROOT,DISK_BUDGET)
     bot_session = StringSession()
     if os.getenv('BOT_DC_ID') and os.getenv('BOT_DC_IP'):
@@ -1805,6 +1860,7 @@ async def main():
         for task in list(BACKGROUND):
             task.cancel()
         await asyncio.gather(*list(BACKGROUND),return_exceptions=True)
+        if TRANSPORTS:await TRANSPORTS.close()
         if CHECKPOINTS:
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(durable_flush(critical=True),20)

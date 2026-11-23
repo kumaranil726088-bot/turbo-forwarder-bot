@@ -18,6 +18,7 @@ from telethon.tl.functions.auth import ExportAuthorizationRequest, ImportAuthori
 from telethon.tl.functions.upload import GetFileRequest, SaveFilePartRequest, SaveBigFilePartRequest
 from telethon.tl.types import InputFile, InputFileBig
 from telethon.errors import FloodWaitError
+from transport_pool import ACTIVE_POOL
 
 CHUNK = 512 * 1024
 POST = re.compile(r'(?:https?://)?(?:www\.)?t\.me/(?:(c)/(\d+)|([A-Za-z][\w]{2,63}))/(\d+)(?:/(\d+))?(?:\s*[-–—]\s*(\d+))?', re.I)
@@ -96,28 +97,46 @@ async def retry(fn,*args,**kw):
             await asyncio.sleep(exc.seconds+1)
 
 class Parallel:
-    def __init__(self,client,connections=4):
+    def __init__(self,client,connections=4,*,reuse=True):
         self.client = client
         self.n = max(1,min(6,int(connections)))
         self.senders = []
+        self.pool=ACTIVE_POOL.get() if reuse else None
+        self.lease=None;self.failed=False
     async def open(self,dc_id):
         c = self.client
         dc_id = dc_id or c.session.dc_id
+        self.failed=False
+        if self.pool:
+            self.lease=await self.pool.acquire(c,dc_id,self.n,lambda:Parallel(c,self.n,reuse=False))
+            self.senders=list(self.lease['transport'].senders)
+            return
         dc = await c._get_dc(dc_id)
-        async def connect_one():
+        remote_key=None
+        async def connect_one(export=False):
             same=dc_id==c.session.dc_id
-            key=AuthKey(c.session.auth_key.key) if same else None
+            key=AuthKey(c.session.auth_key.key) if same else (AuthKey(remote_key.key) if remote_key else None)
             sender=MTProtoSender(key,loggers=c._log,retries=2)
             self.senders.append(sender)
             await sender.connect(c._connection(dc.ip_address,dc.port,dc.id,loggers=c._log,proxy=c._proxy,local_addr=c._local_addr))
             init=copy.copy(c._init_request)
-            if same:init.query=GetConfigRequest()
-            else:
+            if export:
                 auth=await retry(c,ExportAuthorizationRequest(dc_id))
                 init.query=ImportAuthorizationRequest(auth.id,auth.bytes)
+            else:init.query=GetConfigRequest()
             await sender.send(InvokeWithLayerRequest(LAYER,init))
-        tasks=[asyncio.create_task(connect_one()) for _ in range(self.n)]
+            return sender
+        tasks=[]
         try:
+            remaining=self.n
+            if dc_id!=c.session.dc_id:
+                # Export/import is a one-use pair; serialize with Telethon's own
+                # borrowed-sender flow. Then reuse that DC auth key for followers.
+                async with c._borrow_sender_lock:
+                    first=await connect_one(export=True)
+                    remote_key=first.auth_key
+                remaining-=1
+            tasks=[asyncio.create_task(connect_one()) for _ in range(remaining)]
             await asyncio.gather(*tasks)
         except BaseException:
             for task in tasks:
@@ -126,6 +145,11 @@ class Parallel:
             await self.close()
             raise
     async def close(self):
+        if self.lease is not None:
+            entry,self.lease=self.lease,None
+            self.senders=[]
+            await self.pool.release(entry,discard=self.failed)
+            return
         await asyncio.gather(*(s.disconnect() for s in self.senders),return_exceptions=True)
         self.senders.clear()
     async def _workers(self, total, fn):
@@ -163,6 +187,9 @@ class Parallel:
                         progress(done,size)
                 await self._workers(total,part)
             return path
+        except BaseException:
+            self.failed=True
+            raise
         finally:
             await self.close()
     async def upload(self,path,progress=None):
@@ -192,5 +219,8 @@ class Parallel:
                 for chunk in iter(lambda:f.read(CHUNK),b''):
                     digest.update(chunk)
             return InputFile(file_id,total,Path(path).name,digest.hexdigest())
+        except BaseException:
+            self.failed=True
+            raise
         finally:
             await self.close()
