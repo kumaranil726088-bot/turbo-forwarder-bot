@@ -153,6 +153,15 @@ class BotResilienceTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await fixtures.AsyncTests.asyncTearDown(self)
         bot.RECOVERY,bot.CHECKPOINTS=self.before
+    async def test_session_handoff_blocks_reuse_until_previous_instance_retires(self):
+        gate=asyncio.Event();client=NS()
+        with patch('bot.SESSION_HANDOFF',gate),patch('bot.RECOVERY',NS(ensure=AsyncMock(return_value=client))):
+            task=asyncio.create_task(bot.ensure_session(2))
+            await asyncio.sleep(.01)
+            self.assertFalse(task.done())
+            gate.set()
+            self.assertIs(await task,client)
+
     async def test_login_is_idempotent_when_connected(self):
         cl=NS(is_connected=lambda:True);bot.USER_CLIENTS[2]=cl
         await bot.command(Event(2),'login','')

@@ -72,6 +72,7 @@ CHECKPOINTS = None
 RECOVERY = None
 SUPPORT_URL = 'https://t.me/SyntaxError_2'
 SYNC_WARNING_AT = 0
+SESSION_HANDOFF = None
 
 
 def spawn(coro):
@@ -142,6 +143,8 @@ def support_buttons():
 
 
 async def ensure_session(uid,optional=False,force=False):
+    if SESSION_HANDOFF and not SESSION_HANDOFF.is_set():
+        await SESSION_HANDOFF.wait()
     if RECOVERY:
         return await RECOVERY.ensure(uid,optional=optional,force=force)
     # Tests and local deployments can inject a registry without creating a manager.
@@ -493,6 +496,8 @@ async def stop_job(uid):
 
 
 async def connect_user(uid,session):
+    if SESSION_HANDOFF and not SESSION_HANDOFF.is_set():
+        await SESSION_HANDOFF.wait()
     if not DB.cipher:
         raise ValueError('SESSION_KEY is required for session import/login')
     if uid not in USER_CLIENTS and len(USER_CLIENTS)>=MAX_SESSIONS:
@@ -803,7 +808,7 @@ async def start_login(e):
         raise ValueError('Owner must configure SESSION_KEY before logins')
     await close_login(e.sender_id)
     LOGINS[e.sender_id] = dict(step='phone',created=time.time())
-    await respond(e,'🔐 Your private login\nSend your phone with country code (+91…).\nUse the inline keypad for OTP; never send the plain OTP as a chat message.\nYour session is encrypted at rest. Bot operator can access server-side sessions; only log in if you trust this deployment. /cancellogin')
+    await respond(e,'🔐 Your private login\nSend your phone with country code (+91…).\nUse the inline keypad for OTP; never send the plain OTP as a chat message.\nYour session is encrypted at rest; when remote recovery is enabled, encrypted checkpoints are stored in a private GitHub repo. The operator controls the decryption key and can access server-side sessions. Only log in if you trust this deployment. /cancellogin')
     return True
 
 
@@ -1469,6 +1474,7 @@ async def health(request):
                                   persistence='encrypted-checkpoints' if CHECKPOINTS else 'external' if os.getenv('PERSISTENT_STORAGE')=='1' else 'ephemeral',
                                   checkpoint_ok=not bool(CHECKPOINTS.remote.error) if CHECKPOINTS else False,
                                   checkpoint_age=int(time.time()-CHECKPOINTS.remote.last_success) if CHECKPOINTS and CHECKPOINTS.remote.last_success else None,
+                                  session_recovery_ready=not SESSION_HANDOFF or SESSION_HANDOFF.is_set(),
                                   session_encryption=bool(DB and DB.cipher)))
 
 
@@ -1555,9 +1561,10 @@ async def migrate_routes(uid):
 
 
 async def main():
-    global BOT,DB,TRANSFER_LIMIT,USERNAME,STOPPING,CHECKPOINTS,RECOVERY
+    global BOT,DB,TRANSFER_LIMIT,USERNAME,STOPPING,CHECKPOINTS,RECOVERY,SESSION_HANDOFF
     if not API_ID or not API_HASH or not BOT_TOKEN:
         raise RuntimeError('API_ID, API_HASH and BOT_TOKEN are required')
+    SESSION_HANDOFF=asyncio.Event()
     ROOT.mkdir(parents=True,exist_ok=True)
     # Only clean this application's stale transfer dirs, never persistent thumbnails.
     for p in ROOT.glob('u_*_*'):
@@ -1593,6 +1600,13 @@ async def main():
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner,'0.0.0.0',int(os.getenv('PORT','8080'))).start()
+    # Render may briefly overlap old/new web processes. Let the old instance retire
+    # before reusing MTProto auth keys on the new host; this reduces duplicate-key revocation risk.
+    handoff=max(0,float(os.getenv('SESSION_HANDOFF_SECONDS','45' if os.getenv('RENDER') else '0')))
+    if handoff:
+        log.info('Session recovery handoff: waiting %.0fs for previous instance shutdown',handoff)
+        await asyncio.sleep(handoff)
+    SESSION_HANDOFF.set()
     env_session = os.getenv('USER_SESSION')
     if env_session and not DB.get(OWNER_ID,'session'):
         DB.set(OWNER_ID,'session',env_session)

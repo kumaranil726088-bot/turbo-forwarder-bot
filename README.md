@@ -6,6 +6,7 @@ Telegram bot: **@TurboForwarderPro_Bot**. Open access is the default: `OWNER_ID`
 ## V6.2: saved login recovery and automatic forwarding
 
 - `/login` is idempotent: an already-valid account is reused, not sent through another OTP flow. Private commands, destination checks and watch creation automatically reconnect the requesting user's saved session. A lifecycle lock deduplicates concurrent reconnect attempts.
+- On Render, an explicit recovery handoff delay (default 45s, configurable) starts after HTTP binds, so the old deployment has time to retire before the new process reuses account auth keys. This reduces overlapping-MTProto-session revocation risk, but is not horizontal-scaling support. `/health` shows `session_recovery_ready` during this window.
 - A 15-second session monitor retries saved account connections with bounded backoff. Temporary transport/capacity failures keep the saved session and do not ask for OTP. Telegram expiry/revocation, explicit `/logout`, account deactivation or invalidated authorization still require fresh login; no application can promise an irrevocable Telegram session.
 - A dialog-cache warm-up failure does not discard an authenticated account. Recovering a session from inside a job no longer cancels that calling job.
 - Private watches retain live events + polling, original media extraction where Telegram allows it, albums, metadata and thumbnails. Failure retries use bounded backoff and honor FloodWait. Route errors remain visible and do not skip the failed cursor.
@@ -27,7 +28,7 @@ For this small deployment, a **separate private GitHub repository** is used for 
 - This is a low-volume recovery mechanism, **not** an unlimited/free transactional database, not an uptime solution, and not suitable for high write rates or large-scale bot hosting. GitHub quotas/terms, network outages, Render sleep, Telegram limits and the 10-MiB snapshot cap apply. Use a managed transactional database/persistent server at scale.
 - Media/custom-thumbnail files are not included. Manual `/backup` remains an independent recovery fallback. Keep both repositories private/public as intended: the state repository must remain **PRIVATE**. Losing/changing `SESSION_KEY` makes saved snapshots unreadable.
 
-Tests: `python -m unittest test_v6 test_ui test_resilience -v` — **97 tests** including real local-Git subprocess recovery, stale-writer fencing, session recovery, permission gates and watch regressions. A separate real private-GitHub verification branch was also used to test encrypted write → fresh-store recovery and was removed afterwards. These tests do not claim a live end-to-end test of users' private channels.
+Tests: `python -m unittest test_v6 test_ui test_resilience -v` — **98 tests** including real local-Git subprocess recovery, stale-writer fencing, session recovery, permission gates and watch regressions. A separate real private-GitHub verification branch was also used to test encrypted write → fresh-store recovery and was removed afterwards. These tests do not claim a live end-to-end test of users' private channels.
 
 ## Retained V6.1 interface and owner controls
 
