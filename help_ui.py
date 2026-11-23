@@ -129,7 +129,7 @@ Naya route latest post se start hota hai. Pause/resume stored cursor se backlog 
    Apni current settings dekhein; auto-detect, sender aur mode buttons se badlein.
 
 /setchannel @destination
-   Destination save karein. Alias: /settarget.
+   Verified destination save karein. Paused batch ka destination bhi update hota hai; cursor retained. Active batch pehle /stop karein. Already sent posts replay nahi hote. Alias: /settarget.
 
 /setchannel -1001234567890:42
    Destination forum topic 42 save karein.
@@ -140,8 +140,11 @@ Naya route latest post se start hota hai. Pause/resume stored cursor se backlog 
 /why <post link>
    Read-only transfer-path check: source/sender mismatch, protection, rename/thumb, current destination. No file downloaded/sent.
 
+/setsender auto
+   Selected channel/group → your authorized account; private default → bot DM. Explicit overrides: /setsender bot or /setsender user.
+
 /fast
-   User/Bot sender profile choose karein. User sender + own private default destination means Saved Messages, not this bot DM. Restricted content still requires permitted extraction.
+   Auto recommended; Auto/User/Bot sender profile choose karein. User sender + own private default destination means Saved Messages, not this bot DM. Restricted content still requires permitted extraction.
 
 /setmode turbo
    Options: turbo, copy, download, forward. Native forwarding same session aur allowed source par hi hoti hai.
@@ -274,7 +277,7 @@ SLASH_MENU = [
 ('grouptransfer','🗂 Transfer group messages and forum topics'),('bottransfer','🤖 Transfer my bot conversation messages'),
 ('settings','⚙ My settings and real toggles'),('setchannel','🎯 Set destination chat or forum topic'),
 ('settarget','🎯 Alias for setchannel'),('id','🆔 Show chat/message/topic IDs'),
-('setmode','⚡ Select turbo/copy/download/forward'),('setworkers','⚡ Set preparation workers (1–5)'),
+('setsender','🚀 Auto/User/Bot sender; destination unchanged'),('setmode','⚡ Select turbo/copy/download/forward'),('setworkers','⚡ Set preparation workers (1–5)'),
 ('setconnections','⚡ Set transport connections (1–6)'),('setdelay','⏱ Set minimum send delay'),
 ('setpoll','🔄 Set live catch-up interval'),('setfilter','🔎 Select all or text-only'),
 ('settypes','🔎 Select media/message types'),('setcaption','✏ Set my caption template'),

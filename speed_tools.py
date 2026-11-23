@@ -23,9 +23,9 @@ class MetadataCache:
 
 def transfer_plan(client,sender,source,messages,cfg):
     if cfg.get('mode')=='download':return False,'Download mode explicitly selected'
-    if client is not sender:return False,'Source account and sending account differ; choose User sender only if its destination is intended'
     if getattr(source,'noforwards',False) or any(getattr(m,'noforwards',False) for m in messages):
         return False,'Source content protection is enabled; native copying unavailable'
     if cfg.get('rename') or cfg.get('thumb'):
         return False,'Filename/custom thumbnail changes require reupload'
+    if client is not sender:return False,'Source account and sending account differ; choose User sender only if its destination is intended'
     return True,'Same-session server-side candidate; Telegram still checks access and file references'

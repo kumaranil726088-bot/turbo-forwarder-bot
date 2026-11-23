@@ -1,4 +1,4 @@
-"""Turbo Forwarder V6.4 — scoped warm transports and explainable transfer paths.
+"""Turbo Forwarder V6.5 — destination-aware automatic sender selection.
 Use only for content you are authorized to copy. Telegram permissions still apply.
 """
 import asyncio
@@ -26,7 +26,7 @@ from telethon.extensions import html as tl_html
 from telethon.tl.functions.bots import SetBotCommandsRequest
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest, GetForumTopicsRequest, CreateForumTopicRequest
-from telethon.tl.types import BotCommand, BotCommandScopeDefault, BotCommandScopePeer, DocumentAttributeFilename, Channel
+from telethon.tl.types import BotCommand, BotCommandScopeDefault, BotCommandScopePeer, DocumentAttributeFilename, Channel, Chat
 from telethon.errors import SessionPasswordNeededError, FloodWaitError
 
 import control_ui
@@ -43,7 +43,7 @@ from transfer import Parallel, TYPES, parse_links, parse_post_link, source_ref, 
 from dotenv import load_dotenv
 load_dotenv()
 
-VERSION = '6.4'
+VERSION = '6.5'
 START = time.time()
 API_ID = int(os.getenv('API_ID','0'))
 API_HASH = os.getenv('API_HASH','')
@@ -197,14 +197,36 @@ async def fetcher(uid,src):
     return BOT
 
 
+def configured_sender(uid,cfg):
+    mode=cfg.get('sender','Auto')
+    if mode not in ('Auto','Bot','User'):raise ValueError('Sender must be Auto, Bot or User')
+    if mode!='Auto':return mode
+    ref,_=destination(cfg.get('target') or str(uid))
+    return 'Bot' if ref==str(uid) else 'User'
+
+
+def destination_label(uid,cfg):
+    ref,_=destination(cfg.get('target') or str(uid))
+    if ref==str(uid):return 'Saved Messages' if configured_sender(uid,cfg)=='User' else 'this bot DM'
+    return str(cfg['target'])
+
+
+def cycle_sender(current):
+    modes=('Auto','User','Bot')
+    return modes[(modes.index(current)+1)%len(modes)]
+
+
 async def destination_entity(uid,cfg):
     ref,topic = destination(cfg.get('target') or str(uid))
     topic = int(cfg.get('topic') or topic or 0) or None
-    sender = await ensure_session(uid) if cfg.get('sender') == 'User' else BOT
+    chosen=configured_sender(uid,cfg)
+    sender = await ensure_session(uid) if chosen == 'User' else BOT
     # Shared bot admin rights must never grant an unrelated user access to a chat.
     if ref != str(uid):
         own = await ensure_session(uid)
         own_ent = await entity(own,ref)
+        if cfg.get('sender','Auto')=='Auto' and not isinstance(own_ent,(Channel,Chat)):
+            raise ValueError('Auto destination must be a channel/group; private default stays in this bot chat')
         rights = await retry(own.get_permissions,own_ent,'me')
         if getattr(own_ent,'broadcast',False) and not (getattr(rights,'is_admin',False) or getattr(rights,'is_creator',False)):
             raise ValueError('You must be an admin of the destination channel')
@@ -321,7 +343,7 @@ async def prepare_core(uid,src,mid,cfg,index,folder,seen,next_admission=None):
         if next_admission:next_admission.set()
         return {'skip':True,'ids':all_ids,'reason':'Album member already handled or filtered'}
     # Files are copied with their original session, not a cross-account access hash.
-    sender = USER_CLIENTS.get(uid) if cfg.get('sender') == 'User' else BOT
+    sender = USER_CLIENTS.get(uid) if configured_sender(uid,cfg) == 'User' else BOT
     direct,reason=transfer_plan(cl,sender,source,group,cfg)
     job=JOBS.get(uid)
     if job and cfg.get('_job_id')==job['id']:job['path_reason']=reason
@@ -499,14 +521,14 @@ def save_job_checkpoint(uid,links,cfg,start,topic_map):
 def record_failure(uid,src,mid,cfg,exc):
     rows=DB.get(uid,'failed_items',[]) or []
     target=str(cfg.get('target') or uid)
-    rows=[r for r in rows if not (str(r['src'])==str(src) and r['mid']==mid and r['target']==target and (r.get('topic') or None)==(cfg.get('topic') or None) and r.get('sender','Bot')==cfg.get('sender','Bot'))]
-    rows.append(dict(src=str(src),mid=mid,target=target,topic=cfg.get('topic') or None,sender=cfg.get('sender','Bot'),error=type(exc).__name__+': '+str(exc)[:250],time=time.time()))
+    rows=[r for r in rows if not (str(r['src'])==str(src) and r['mid']==mid and r['target']==target and (r.get('topic') or None)==(cfg.get('topic') or None) and r.get('sender','Bot')==configured_sender(uid,cfg))]
+    rows.append(dict(src=str(src),mid=mid,target=target,topic=cfg.get('topic') or None,sender=configured_sender(uid,cfg),error=type(exc).__name__+': '+str(exc)[:250],time=time.time()))
     DB.set(uid,'failed_items',rows[-500:])
 
 
 def forget_failure(uid,src,ids,cfg):
     rows=DB.get(uid,'failed_items',[]) or []
-    filtered=[r for r in rows if not (str(r['src'])==str(src) and r['mid'] in ids and r['target']==str(cfg.get('target') or uid) and (r.get('topic') or None)==(cfg.get('topic') or None) and r.get('sender','Bot')==cfg.get('sender','Bot'))]
+    filtered=[r for r in rows if not (str(r['src'])==str(src) and r['mid'] in ids and r['target']==str(cfg.get('target') or uid) and (r.get('topic') or None)==(cfg.get('topic') or None) and r.get('sender','Bot')==configured_sender(uid,cfg))]
     if len(rows)!=len(filtered):DB.set(uid,'failed_items',filtered)
 
 
@@ -602,7 +624,7 @@ async def update_card(uid,final=False):
     run_sent=job['ok']-job.get('base_ok',0)
     down=job.get('download_bytes',0)/1048576;up=job.get('upload_bytes',0)/1048576
     text=(f"⚡ V{VERSION} TRANSFER — {job['state']}\n━━━━━━━━━━━━━━━━━━━━\n\n"
-          f"Queue cursor: {job['done']}/{job['total']}\nProcessed this run: {job.get('processed_run',0)}\n"
+          f"Destination: {job.get('target_label','See job settings')}\nSender: {job.get('sender_label','See job settings')}\n\nQueue cursor: {job['done']}/{job['total']}\nProcessed this run: {job.get('processed_run',0)}\n"
           f"Messages sent (known cumulative): {job['ok']}\nSent this run: {run_sent}\n"
           f"Skipped/filtered units: {job.get('skipped',0)} | Failed: {job.get('failed',0)}\n"
           f"Polls archived as text: {job.get('polls',0)}\nServer-side copies: {job.get('server_copies',0)}\n\n"
@@ -629,11 +651,11 @@ async def start_job_locked(e,links,cfg=None,start=0,topic_map=None,stats=None):
     if not links or len(links)>10000:raise ValueError('Choose between 1 and 10,000 posts')
     complete_cfg=cfg_for(uid);complete_cfg.update(cfg or {});cfg=complete_cfg
     cfg['_settings_baseline']={k:DB.get(uid,k) for k in ('sender','mode','workers','connections','delay','filter','type_filters')}
-    card=await respond(e,'⚡ Starting your ordered queue. Polls will be archived as text where native forwarding is unavailable. Live byte counters update during large transfers.')
+    card=await respond(e,'Destination: '+destination_label(uid,cfg)+'\nSender: '+cfg['sender']+' → '+configured_sender(uid,cfg)+'\n\n⚡ Starting your ordered queue. Polls will be archived as text where native forwarding is unavailable. Live byte counters update during large transfers.')
     stats=stats or {}
     JOBS[uid]=dict(id=uuid.uuid4().hex[:12],ok=int(stats.get('ok',0)),base_ok=int(stats.get('ok',0)),
         skipped=int(stats.get('skipped',0)),failed=int(stats.get('failed',0)),polls=int(stats.get('polls',0)),server_copies=int(stats.get('server_copies',0)),
-        done=start,total=len(links),cancel=False,started=time.time(),updated=0,state='Running',card=card,processed_run=0)
+        target_label=destination_label(uid,cfg),sender_label=cfg['sender']+' → '+configured_sender(uid,cfg),done=start,total=len(links),cancel=False,started=time.time(),updated=0,state='Running',card=card,processed_run=0)
     cfg['_job_id']=JOBS[uid]['id']
     save_job_checkpoint(uid,links,cfg,start,topic_map)
     JOBS[uid]['task']=spawn(run_job(uid,links,cfg,start,topic_map))
@@ -1046,7 +1068,8 @@ async def submit_code(e,state):
 async def settings_view(e):
     cfg = cfg_for(e.sender_id)
     text = '⚙ Your isolated settings\n'+'\n'.join(f'{k}: {cfg[k]}' for k in ('target','sender','mode','workers','connections','delay','poll','filter','auto','caption','replacements'))
-    await respond(e,text,[[Button.inline('Toggle auto-detect',b'set_auto'),Button.inline('Toggle sender',b'set_sender')],
+    text+='\n\nAuto sender: channel/group → your authorized account; default private destination → this bot DM. User sender + own private destination → Saved Messages.'
+    await respond(e,text,[[Button.inline('Toggle auto-detect',b'set_auto'),Button.inline('Cycle sender: '+cfg['sender'],b'set_sender')],
                           [Button.inline('Cycle mode',b'set_mode'),Button.inline('Reset options',b'reset_menu')]])
 
 
@@ -1265,11 +1288,11 @@ async def command(e,cmd,arg):
         size=sum((m.file.size or 0) for m in messages if m.file)/1048576
         return await respond(e,'🔎 TRANSFER PATH CHECK (no file download/send)\n\n'+
             ('Server-side candidate — no full file transfer needed if Telegram accepts it.' if direct else 'Full download + upload may be required.')+
-            '\nReason: '+reason+f"\nSender: {cfg['sender']} | Mode: {cfg['mode']}\nDestination: {cfg.get('target') or uid} | Topic: {topic}\nKnown media size: {size:.1f} MiB"+
+            '\nReason: '+reason+f"\nSender: {cfg['sender']} → {configured_sender(uid,cfg)} | Mode: {cfg['mode']}\nDestination: {cfg.get('target') or uid} | Topic: {topic}\nKnown media size: {size:.1f} MiB"+
             ('\nUser sender default destination means Saved Messages, NOT this bot DM.' if cfg.get('sender')=='User' and str(cfg.get('target') or uid)==str(uid) else '')+
             '\n\nRead-only preflight, not a guaranteed send test. Telegram permissions/protection/FloodWait still apply. /fast to choose a sender profile.')
     if cmd == 'fast':
-        return await respond(e,'⚡ FAST PROFILE — choose deliberately\n\nUser sender can reuse Telegram media server-side when your account has source + destination access and copying is allowed. Large file size then need not consume Render download/upload bandwidth.\n\nWith your private default destination, USER sender writes to Saved Messages, NOT this bot chat. Channel/group destinations remain the selected channel/group.\n\nRestricted/renamed/custom-thumbnail media may still require full download + upload. This cannot bypass permissions, flood waits or hosting limits. No 2-hour guarantee.\n\nThis changes future transfers. For a paused job, /resume applies changed transport settings.',[[Button.inline('Enable User sender fast profile',b'speed_user')],[Button.inline('Keep Bot sender (safe current destination)',b'speed_bot')],[Button.inline('Cancel',b'nav_home')]])
+        return await respond(e,'⚡ FAST PROFILE — Auto recommended\n\nAuto uses your authorized account for the selected channel/group, but keeps the private default in this bot DM. Your selected destination never changes.\n\nUser sender can reuse Telegram media server-side when your account has source + destination access and copying is allowed. Large file size then need not consume Render download/upload bandwidth.\n\nWith your private default destination, USER sender writes to Saved Messages, NOT this bot chat. Channel/group destinations remain the selected channel/group.\n\nRestricted/renamed/custom-thumbnail media may still require full download + upload. This cannot bypass permissions, flood waits or hosting limits. No 2-hour guarantee.\n\nThis changes future transfers. For a paused job, /resume applies changed transport settings.',[[Button.inline('Recommended: Auto sender for selected channel',b'speed_auto')],[Button.inline('Explicit User sender',b'speed_user')],[Button.inline('Keep Bot sender (safe current destination)',b'speed_bot')],[Button.inline('Cancel',b'nav_home')]])
     if cmd == 'failed':
         rows=DB.get(uid,'failed_items',[]) or []
         if not rows:return await respond(e,'No recorded content-item failures. Global permission/network failures pause at their checkpoint instead.')
@@ -1278,8 +1301,8 @@ async def command(e,cmd,arg):
         return await BOT.send_file(uid,file,caption='Content failures are retained for retry. /retryfailed uses your current destination/settings.',parse_mode=None)
     if cmd == 'retryfailed':
         cfg=cfg_for(uid)
-        rows=[r for r in (DB.get(uid,'failed_items',[]) or []) if r['target']==str(cfg.get('target') or uid) and (r.get('topic') or None)==(cfg.get('topic') or None) and r.get('sender','Bot')==cfg.get('sender','Bot')]
-        if not rows:raise ValueError('No failed items matching your current destination, topic and sender. /failed to inspect others.')
+        rows=[r for r in (DB.get(uid,'failed_items',[]) or []) if r['target']==str(cfg.get('target') or uid) and (r.get('topic') or None)==(cfg.get('topic') or None) and r.get('sender','Bot')==configured_sender(uid,cfg)]
+        if not rows:raise ValueError('No failed items matching your current destination, topic and effective sender. /failed to inspect others.')
         return await start_job(e,list(dict.fromkeys((r['src'],r['mid']) for r in rows)),cfg)
     if cmd == 'discard':
         if uid in JOBS:
@@ -1305,12 +1328,37 @@ async def command(e,cmd,arg):
                 t.cancel()
         return await respond(e,f'Deleted {len(selected)} of your routes.')
     if cmd in ('settarget','setchannel'):
+        if not arg.strip():raise ValueError('/setchannel @destination or /setchannel -100channelid[:topic]')
+        if uid in JOBS:raise ValueError('/stop the active batch before changing its destination, then /setchannel and /resume')
         cfg = cfg_for(uid)
         cfg.update(target=arg,topic=None)
         await destination_entity(uid,cfg)
+        if uid in JOBS:raise ValueError('A batch started during destination verification. /stop before changing it.')
         DB.set(uid,'target',arg)
         DB.set(uid,'topic',None)
-        return await respond(e,'✅ Your destination verified and saved: '+arg)
+        pending=DB.get(uid,'pending_job')
+        cleared_map=False
+        if pending:
+            pending_cfg=dict(pending.get('cfg') or {})
+            if str(pending_cfg.get('target') or pending.get('target') or uid)!=str(arg) and pending.get('topic_map'):
+                pending['topic_map']=None;cleared_map=True
+            pending_cfg.update(target=arg,topic=None,sender=cfg['sender'])
+            pending['cfg']=pending_cfg;DB.set(uid,'pending_job',pending)
+        return await respond(e,'✅ Destination verified and saved: '+arg+'\nSender: '+cfg['sender']+' → '+configured_sender(uid,cfg)+('\nPaused batch destination updated; cursor retained. /resume' if pending else '\nNew transfers use this destination. /watch <source> to add automatic new-post forwarding.')+('\nOld destination forum-topic map cleared; the newly selected destination/topic will be used.' if cleared_map else '')+('\nAlready sent posts are not moved or replayed.' if pending else ''))
+    if cmd == 'setsender':
+        if uid in JOBS:raise ValueError('/stop before changing the active sender, then /resume')
+        value=arg.strip().title()
+        if value not in ('Auto','Bot','User'):raise ValueError('/setsender auto | bot | user')
+        cfg=cfg_for(uid);cfg['sender']=value
+        if value=='User':await ensure_session(uid)
+        await destination_entity(uid,cfg)
+        if uid in JOBS:raise ValueError('A batch started during sender verification. /stop before changing it.')
+        DB.set(uid,'sender',value)
+        pending=DB.get(uid,'pending_job')
+        if pending:
+            pending_cfg=dict(pending.get('cfg') or {});pending_cfg['sender']=value
+            pending['cfg']=pending_cfg;DB.set(uid,'pending_job',pending)
+        return await respond(e,'✅ Sender: '+value+' → '+configured_sender(uid,cfg)+'. Destination unchanged.'+(' User private default means Saved Messages.' if value=='User' else '')+'\n/resume for a paused batch.')
     if cmd in ('setmode','setfilter','settypes','setworkers','setconnections','setdelay','setpoll'):
         key = cmd[3:]
         value = arg.strip()
@@ -1387,7 +1435,7 @@ async def command(e,cmd,arg):
 
 
 ADMIN_COMMANDS = {'admin','users','broadcast','ban','unban','approve','alljobs','access','backup','restore'}
-COMMANDS = set('start help why fast failed retryfailed support id login reconnect cancellogin logout session exportsession chats dialogs join forward publicforward save batch grouptransfer bottransfer cancel stop resume discard watch watchlist unwatch settarget setchannel setmode setfilter settypes setworkers setconnections setdelay setpoll setcaption clearcaption clearreplace replace replaces settings reset status stats myplan dyno_status ping cleanup_ram'.split()) | ADMIN_COMMANDS
+COMMANDS = set('start help why fast failed retryfailed support id login reconnect cancellogin logout session exportsession chats dialogs join forward publicforward save batch grouptransfer bottransfer cancel stop resume discard watch watchlist unwatch settarget setchannel setsender setmode setfilter settypes setworkers setconnections setdelay setpoll setcaption clearcaption clearreplace replace replaces settings reset status stats myplan dyno_status ping cleanup_ram'.split()) | ADMIN_COMMANDS
 
 
 async def admin(e,cmd,arg):
@@ -1462,12 +1510,13 @@ async def callbacks(e):
         control_ui.CONFIRM.clear()
     if data.startswith('watchpage_'):
         return await watch_view(e,int(data[10:]))
-    if data in ('speed_user','speed_bot'):
+    if data in ('speed_auto','speed_user','speed_bot'):
         if uid in JOBS:raise ValueError('/stop your current job before changing its speed profile, then /resume')
         cfg=cfg_for(uid)
-        cfg.update(sender='User' if data=='speed_user' else 'Bot',mode='copy',workers=2,connections=4,delay=.1)
+        cfg.update(sender={'speed_auto':'Auto','speed_user':'User','speed_bot':'Bot'}[data],mode='copy',workers=2,connections=4,delay=.1)
         if data=='speed_user':await ensure_session(uid)
         await destination_entity(uid,cfg)
+        if uid in JOBS:raise ValueError('A batch started during profile verification. /stop before changing it.')
         for key in ('sender','mode','workers','connections','delay'):DB.set(uid,key,cfg[key])
         pending=DB.get(uid,'pending_job')
         if pending:
@@ -1538,7 +1587,7 @@ async def callbacks(e):
             PANELS.pop(uid,None)
             return
         if action == 'sender':
-            st['cfg']['sender'] = 'User' if st['cfg']['sender']=='Bot' else 'Bot'
+            st['cfg']['sender'] = cycle_sender(st['cfg']['sender'])
             return await show_panel(e,st)
         if action not in ('promo','caption','rename','hyperlink','thumb','topic'):
             raise ValueError('Unknown panel action')
@@ -1550,7 +1599,8 @@ async def callbacks(e):
         if key == 'auto':
             DB.set(uid,'auto',not DB.get(uid,'auto'))
         elif key == 'sender':
-            value = 'User' if DB.get(uid,'sender')=='Bot' else 'Bot'
+            if uid in JOBS:raise ValueError('/stop before changing the active sender, then /resume')
+            value = cycle_sender(DB.get(uid,'sender'))
             if value=='User':
                 await ensure_session(uid)
             DB.set(uid,'sender',value)
@@ -1679,7 +1729,7 @@ async def dispatch(e):
         safe = str(exc)[:350] if isinstance(exc,(ValueError,IOError)) else type(exc).__name__
         await respond(e,'❌ '+safe+'\n\n/help · /cancel\nSupport: @SyntaxError_2',support_buttons())
     finally:
-        mutations={'settarget','setchannel','watch','unwatch','setmode','setcaption','clearcaption','replace','clearreplace','setworkers','setconnections','setdelay','setpoll','setfilter','settypes','logout','session','access','ban','unban','approve','discard'}
+        mutations={'setsender','settarget','setchannel','watch','unwatch','setmode','setcaption','clearcaption','replace','clearreplace','setworkers','setconnections','setdelay','setpoll','setfilter','settypes','logout','session','access','ban','unban','approve','discard'}
         if CHECKPOINTS and ((match and match[1].lower() in mutations) or (is_callback and e.data.startswith((b'watch_',b'set_',b'repl_',b'reset_',b'adm_confirm_')))):
             await durable_flush(critical=True)
 

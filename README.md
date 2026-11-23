@@ -216,3 +216,39 @@ passed subsequent DC2/DC4 checks. Small ~1MiB upload sample was 2.87s cold / 1.5
 warm. That sample isolates setup overhead and is NOT a 2GB, private-user-account,
 production, or sustained-throughput benchmark. All three temporary test messages
 were removed. No rate-limit bypass, unlimited-storage, uptime or accuracy guarantee.
+
+## V6.5 — destination-aware Auto sender (default)
+
+The previous Bot default caused unnecessary source-account → bot-account reuploads
+when the intended destination was a channel. Default `sender=Auto` now uses the
+requester's own authorized account for channel/group destinations, preserving the
+exact configured channel/topic. Own private/default destination stays **this bot
+DM**; only explicit `User` + own private destination means Saved Messages.
+Existing explicitly stored Bot/User choices remain intact. Private sources still
+require the requester's own session/membership. Every channel destination is
+permission-checked; Auto never falls back to shared bot rights on denial.
+
+- `/setsender auto` enables the policy; explicit overrides `bot` / `user` remain.
+- `/setchannel @destination` (or `-100...[:topic]`) verifies and saves the target,
+  including the paused batch target, without moving the cursor. Already sent
+  posts are not moved/replayed. Active batches must be stopped first. A changed
+  destination clears any old destination-specific forum-topic map visibly.
+- `/resume` then continues remaining posts; other customization/filter settings
+  remain unchanged. Existing routes retain their own destination, not the newly
+  selected global target. New automatic routes: `/watch <source>`; these start
+  with NEW posts. Existing history uses a batch, not an implicit full-history scan.
+- Progress cards show destination and selected → effective sender so a private
+  bot-DM default cannot be mistaken for a configured channel.
+- `/why` reports selected → effective sender. Protection is diagnosed before
+  sender mismatch, so a protected source is not advertised as natively copyable
+  merely by changing accounts. Authorized protected extraction still consumes
+  download/upload bandwidth; no speed/protection/permission bypass guarantee.
+- Failed-item records match the effective Bot/User sender, not policy label Auto.
+- Runtime permission-check races are rechecked before modifying paused settings.
+
+Validation:166 automated tests pass (19 new Auto-sender regressions). Default bot
+DM preservation, explicit Bot/User overrides, channel rights denial, >local-cap
+native candidates without downloader calls, checkpoint retarget/cursor preservation,
+source/destination same-client planning, and per-user isolation tested with mocks.
+No sandbox login using private saved-user sessions and no live private-user channel
+send performed for this release. Production state is restored, never reseeded.

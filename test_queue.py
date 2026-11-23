@@ -95,6 +95,7 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cfg['mode'],'forward');self.assertEqual(cfg['sender'],'User');self.assertEqual(cfg['type_filters'],['video'])
         self.assertEqual(cfg['target'],'@old');self.assertEqual(cfg['caption'],'custom')
     async def test_resume_preserves_panel_sender_unless_setting_changed(self):
+        bot.DB.set(2,'sender','Bot')  # historical explicitly saved baseline
         cfg=bot.cfg_for(2);cfg.update(sender='User',_settings_baseline={'sender':'Bot','mode':'turbo','workers':2,'connections':4,'delay':.1,'filter':'all','type_filters':bot.DB.get(2,'type_filters')})
         bot.DB.set(2,'pending_job',{'links':[['abc',1]],'cfg':cfg,'start':0})
         with patch('bot.start_job',AsyncMock()) as start:await bot.command(Event(2),'resume','')
@@ -164,7 +165,7 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_fast_profile_requires_confirmation_and_does_not_silently_change_sender(self):
         await bot.command(Event(2),'fast','')
-        self.assertEqual(bot.DB.get(2,'sender'),'Bot')
+        self.assertEqual(bot.DB.get(2,'sender'),'Auto')
         e=Event(2);e.data=b'speed_user'
         with patch('bot.ensure_session',AsyncMock()),patch('bot.destination_entity',AsyncMock(return_value=(NS(),NS(),None))):
             await bot.callbacks(e)

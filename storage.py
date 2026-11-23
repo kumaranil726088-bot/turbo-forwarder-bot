@@ -6,7 +6,7 @@ from cryptography.fernet import Fernet
 
 DEFAULTS = dict(mode='turbo', workers=2, connections=4, delay=0.1, poll=10,
                 caption='', replacements=[], type_filters=['text','photo','video','document','audio','voice','animation','sticker','poll'],
-                filter='all', watch=[], auto=True, sender='Bot')
+                filter='all', watch=[], auto=True, sender='Auto')
 
 class Store:
     def __init__(self, path, owner, key=None):
