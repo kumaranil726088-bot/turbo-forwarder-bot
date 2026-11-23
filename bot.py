@@ -31,11 +31,14 @@ from telethon import TelegramClient, events, Button
 from telethon.extensions import html as tl_html
 from telethon.sessions import StringSession
 from telethon.tl.functions.bots import SetBotCommandsRequest
+from telethon.tl.functions.messages import ImportChatInviteRequest
 from telethon.tl.types import (
     PeerChannel,
     MessageMediaWebPage,
     BotCommand,
     BotCommandScopeDefault,
+    DocumentAttributeVideo,
+    DocumentAttributeAudio,
 )
 from telethon.errors import (
     FloodWaitError,
@@ -45,6 +48,12 @@ from telethon.errors import (
     SessionPasswordNeededError,
     PhoneCodeInvalidError,
     PhoneCodeEmptyError,
+    PhoneCodeExpiredError,
+    PhoneNumberInvalidError,
+    PasswordHashInvalidError,
+    UserAlreadyParticipantError,
+    InviteHashExpiredError,
+    InviteHashInvalidError,
 )
 
 # ------------------------------------------------------------------ #
@@ -83,6 +92,7 @@ except RuntimeError:
 client = TelegramClient(StringSession(), API_ID, API_HASH)  # BOT client (in-memory session)
 user_client = None                                          # USER session (fetch power)
 USER_ACTIVE = False
+USER_INFO = ""
 
 os.makedirs(DL_DIR, exist_ok=True)
 
@@ -172,7 +182,20 @@ TOPIC_LINK_RE = re.compile(
     r"(?:https?://)?(?:www\.)?t\.me/c/(\d+)/(\d+)/(\d+)",
     re.IGNORECASE,
 )
+RANGE_TOPIC_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?t\.me/c/(\d+)/(\d+)/(\d+)\s*[-–—]\s*(\d+)",
+    re.IGNORECASE,
+)
+RANGE_LINK_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?t\.me/(c/)?([A-Za-z0-9_]{3,64})/(\d+)\s*[-–—]\s*(\d+)",
+    re.IGNORECASE,
+)
+INVITE_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?t\.me/(?:\+|joinchat/)([A-Za-z0-9_-]{8,64})",
+    re.IGNORECASE,
+)
 PLAIN_RE = re.compile(r"^@?([A-Za-z0-9_]{3,64})\s+(\d+)$", re.IGNORECASE)
+PHONE_RE = re.compile(r"^\+\d{7,15}$")
 
 def parse_post_link(line):
     """Return (chat_ref, msg_id) or None. chat_ref = '-100id' ya 'username'."""
@@ -192,9 +215,35 @@ def parse_post_link(line):
     return None
 
 def parse_all_links(text):
-    """Message me jitne bhi t.me post links hain, sab nikalo."""
+    """Message me single links, topic links, aur range links (t.me/c/.../10-50) sab nikalo."""
     out = []
-    for m in LINK_RE.finditer(text):
+    # Range topic links first: t.me/c/123/23/10-50
+    for m in RANGE_TOPIC_RE.finditer(text):
+        chat_ref = f"-100{m.group(1)}"
+        a, b = int(m.group(3)), int(m.group(4))
+        if a > b:
+            a, b = b, a
+        for i in range(a, min(b, a + 2000) + 1):
+            out.append((chat_ref, i))
+    if out:
+        return out
+    # Range normal/private links: t.me/c/123/10-50 or t.me/chan/10-50
+    for m in RANGE_LINK_RE.finditer(text):
+        chat_ref = f"-100{m.group(2)}" if m.group(1) else m.group(2)
+        a, b = int(m.group(3)), int(m.group(4))
+        if a > b:
+            a, b = b, a
+        for i in range(a, min(b, a + 2000) + 1):
+            out.append((chat_ref, i))
+    if out:
+        return out
+    # Single links (line/token wise so topic links t.me/c/id/topic/msg don't misparse as topic_id)
+    cleaned = TOPIC_LINK_RE.sub(
+        lambda m: f"__TOPIC__{m.group(1)}__{m.group(3)}__", text
+    )
+    for m in re.finditer(r"__TOPIC__(\d+)__(\d+)__", cleaned):
+        out.append((f"-100{m.group(1)}", int(m.group(2))))
+    for m in LINK_RE.finditer(cleaned):
         chat, msg_id = m.group(2), int(m.group(3))
         out.append((f"-100{chat}" if m.group(1) else chat, msg_id))
     return out
@@ -271,6 +320,25 @@ def resolve_for(cl, ref):
             return int(s)
     return ref
 
+async def smart_get_entity(cl, ref):
+    """Private channels (-100...) ka access_hash cache refresh ke saath entity lao."""
+    target = resolve_for(cl, ref)
+    try:
+        return await safe_call(cl.get_entity, target)
+    except ValueError:
+        if cl is user_client and USER_ACTIVE:
+            try:
+                dialogs = await safe_call(cl.get_dialogs, limit=None)
+                if isinstance(ref, str) and ref.strip().startswith("-100") and ref.strip()[4:].isdigit():
+                    want_id = int(ref.strip()[4:])
+                    for d in dialogs:
+                        if getattr(d.entity, "id", None) == want_id:
+                            return d.entity
+                return await safe_call(cl.get_entity, target)
+            except Exception:
+                raise
+        raise
+
 def get_fetcher():
     return user_client if USER_ACTIVE else client
 
@@ -344,6 +412,7 @@ CURRENT = {
     "pending_links": [],
     "cooldown_until": 0,
     "cfg": {},
+    "seen_groups": set(),
 }
 
 def reset_job():
@@ -352,7 +421,8 @@ def reset_job():
         log="Starting Turbo Transfer...", label="", target="",
         phase="🔗 Connecting...", dl=(0, 0), ul=(0, 0), samples=None,
         progress_msg=None, started=0, tasks=[], resumed=False,
-        moved_total=0, idx_offset=0, pending_links=[], cooldown_until=0, cfg={},
+        moved_total=0, idx_offset=0, pending_links=[], cooldown_until=0,
+        cfg={}, seen_groups=set(),
     )
 
 def is_owner(uid):
@@ -516,7 +586,8 @@ async def fetch_msg_group(fetcher, chat, msg_id):
     if not msg:
         return []
     if msg.grouped_id:
-        window = list(range(msg_id, msg_id + 10))
+        start_w = max(1, msg_id - 9)
+        window = list(range(start_w, msg_id + 10))
         group = await safe_call(fetcher.get_messages, chat, ids=window)
         parts = [
             m for m in group
@@ -593,109 +664,199 @@ def _rename_file_if_needed(path, cfg):
             pass
     return path
 
+def _extract_media_attrs(m):
+    """Restricted video/audio ke streaming, w, h, duration preserve karo."""
+    attrs = []
+    doc = getattr(m, "document", None)
+    if not doc or not getattr(doc, "attributes", None):
+        return attrs, False
+    is_vid = False
+    for a in doc.attributes:
+        if isinstance(a, DocumentAttributeVideo):
+            is_vid = True
+            attrs.append(DocumentAttributeVideo(
+                duration=getattr(a, "duration", 0) or 0,
+                w=getattr(a, "w", 0) or 0,
+                h=getattr(a, "h", 0) or 0,
+                round_message=bool(getattr(a, "round_message", False)),
+                supports_streaming=True,
+            ))
+        elif isinstance(a, DocumentAttributeAudio):
+            attrs.append(a)
+    return attrs, is_vid
+
 async def turbo_download(fetcher, msgs, item_dir, cfg=None):
-    """Album/singles per-item temp folder me download karo."""
+    """Album/singles + original thumbnail + streaming metadata download karo."""
     os.makedirs(item_dir, exist_ok=True)
-    paths = []
-    for m in msgs:
+    items = []
+    want_orig_thumb = not (cfg or {}).get("thumb")
+    for idx_m, m in enumerate(msgs):
         if not is_mediaable(m):
             continue
-        CURRENT["phase"] = "📥 Downloading"
+        fname_hint = ""
+        if getattr(m, "file", None) and getattr(m.file, "name", None):
+            fname_hint = f" ({m.file.name[:28]})"
+        CURRENT["phase"] = f"📥 Downloading{fname_hint}"
         p = await safe_call(
             fetcher.download_media, m, file=item_dir,
             progress_callback=make_progress_cb("dl"),
         )
         if p:
-            paths.append(_rename_file_if_needed(p, cfg))
-    return paths
+            p = _rename_file_if_needed(p, cfg)
+            orig_thumb = None
+            if want_orig_thumb and idx_m == 0 and getattr(m, "document", None) and getattr(m.document, "thumbs", None):
+                try:
+                    orig_thumb = await safe_call(
+                        fetcher.download_media, m, thumb=-1,
+                        file=os.path.join(item_dir, f"orig_th_{m.id}.jpg"),
+                    )
+                except Exception:
+                    orig_thumb = None
+            attrs, is_vid = _extract_media_attrs(m)
+            items.append({
+                "path": p,
+                "orig_thumb": orig_thumb,
+                "attrs": attrs,
+                "is_vid": is_vid,
+            })
+    return items
 
-async def turbo_upload(paths, text, dest, cfg):
-    CURRENT["phase"] = "📤 Uploading"
-    dest_ent = resolve_for(client, dest)
+def _pick_uploader(cfg):
+    if (cfg or {}).get("sender") in ("Userbot", "Anonymous") and USER_ACTIVE and user_client:
+        return user_client
+    return client
+
+async def _upload_with_client(up_cl, items, text, dest, cfg):
+    dest_ent = await smart_get_entity(up_cl, dest) if up_cl is user_client else resolve_for(up_cl, dest)
     reply_to = cfg.get("topic") or None
-    thumb = None
+    custom_thumb = None
     if cfg.get("thumb"):
-        thumb = await get_thumb_path(cfg["thumb"])
+        custom_thumb = await get_thumb_path(cfg["thumb"])
+    paths = [it["path"] for it in items]
     if len(paths) > 1:
         try:
             await safe_call(
-                client.send_file, dest_ent, paths,
+                up_cl.send_file, dest_ent, paths,
                 caption=text or "", parse_mode="html",
+                supports_streaming=True,
                 progress_callback=make_progress_cb("ul"),
                 reply_to=reply_to,
             )
         except Exception:
             await safe_call(
-                client.send_file, dest_ent, paths,
+                up_cl.send_file, dest_ent, paths,
                 caption=text or "",
+                supports_streaming=True,
                 progress_callback=make_progress_cb("ul"),
                 reply_to=reply_to,
             )
-    elif paths:
-        kw = {"caption": text or "", "progress_callback": make_progress_cb("ul"), "reply_to": reply_to}
+    elif items:
+        it = items[0]
+        thumb = custom_thumb or it.get("orig_thumb")
+        kw = {
+            "caption": text or "",
+            "progress_callback": make_progress_cb("ul"),
+            "reply_to": reply_to,
+            "supports_streaming": True,
+        }
         if thumb:
             kw["thumb"] = thumb
+        if it.get("attrs"):
+            kw["attributes"] = it["attrs"]
         try:
-            await safe_call(client.send_file, dest_ent, paths[0], parse_mode="html", **kw)
+            await safe_call(up_cl.send_file, dest_ent, it["path"], parse_mode="html", **kw)
         except Exception:
-            await safe_call(client.send_file, dest_ent, paths[0], **kw)
+            await safe_call(up_cl.send_file, dest_ent, it["path"], **kw)
     else:
-        await _send_html_safe(client.send_message, dest_ent, text or "", reply_to=reply_to)
+        await _send_html_safe(up_cl.send_message, dest_ent, text or "", reply_to=reply_to)
+
+async def turbo_upload(items, text, dest, cfg):
+    CURRENT["phase"] = "📤 Uploading"
+    up_cl = _pick_uploader(cfg)
+    try:
+        await _upload_with_client(up_cl, items, text, dest, cfg)
+    except (ChatWriteForbiddenError, ChannelPrivateError, ValueError):
+        if up_cl is client and USER_ACTIVE and user_client:
+            log.info("Bot write fallback -> user_client for dest %s", dest)
+            await _upload_with_client(user_client, items, text, dest, cfg)
+        else:
+            raise
 
 async def transfer_item(dest, chat_ref, msg_id, cfg=None, index=None):
     """
-    Ek post ko dest tak pahunchao.
+    Ek post ko dest tak pahunchao (Public + Private + Restricted 'noforwards' sab!).
     Returns (status, reason): 'ok' | 'skip' | 'fail'
-    Strategy: public/bot instant file_id copy → fail/restricted pe turbo download+upload.
     """
     cfg = cfg or {}
     fetcher = get_fetcher()
-    dest_ent = resolve_for(client, dest)
     CURRENT["phase"] = "🔗 Connecting..."
     CURRENT["dl"] = (0, 0)
     CURRENT["ul"] = (0, 0)
 
-    # Public channel ya /publicforward mode me pehle bot client se try karo (instant server-side copy)
+    # Public channel ya /publicforward mode me pehle bot client se try karo (instant copy)
     bot_msgs = None
+    b_chat = None
     is_public_ref = isinstance(chat_ref, str) and not chat_ref.startswith("-100") and not chat_ref.lstrip("-").isdigit()
     if fetcher is not client and (cfg.get("mode") == "copy" or is_public_ref):
         try:
             b_chat = await safe_call(client.get_entity, resolve_for(client, chat_ref))
-            bot_msgs = await fetch_msg_group(client, b_chat, msg_id)
+            if not getattr(b_chat, "noforwards", False):
+                bot_msgs = await fetch_msg_group(client, b_chat, msg_id)
         except Exception:
             bot_msgs = None
 
-    if bot_msgs:
+    chat_obj = None
+    if bot_msgs and not getattr(bot_msgs[0], "noforwards", False):
         msgs = bot_msgs
+        chat_obj = b_chat
         used_bot = True
     else:
         used_bot = (fetcher is client)
         try:
-            chat = await safe_call(fetcher.get_entity, resolve_for(fetcher, chat_ref))
-            msgs = await fetch_msg_group(fetcher, chat, msg_id)
+            chat_obj = await smart_get_entity(fetcher, chat_ref)
+            msgs = await fetch_msg_group(fetcher, chat_obj, msg_id)
         except (ChannelPrivateError, ValueError):
-            return "fail", f"Chat {chat_ref} accessible nahi (access chahiye)"
+            if not USER_ACTIVE:
+                return "fail", "Private/Restricted chat — pehle /login karein"
+            return "fail", f"Chat {chat_ref} me aapka account joined nahi hai (/join use karein)"
     if not msgs:
-        return "fail", f"Message #{msg_id} not found"
+        return "fail", f"Message #{msg_id} empty/deleted"
 
     first = msgs[0]
+    # Album deduplication in range/batch jobs
+    gid = getattr(first, "grouped_id", None)
+    if gid and CURRENT["active"]:
+        seen = CURRENT.get("seen_groups")
+        if isinstance(seen, set):
+            if gid in seen:
+                return "skip", "Album part already transferred"
+            seen.add(gid)
+
     # Message-type filter
     enabled = get_type_filters()
     if msg_type(first) not in enabled:
         return "skip", f"Type filtered: {msg_type(first)}"
 
+    # Caption source (album me kabhi caption 2nd item pe hota hai)
+    cap_msg = first
+    if not (first.message or "") and len(msgs) > 1:
+        for m in msgs:
+            if m.message:
+                cap_msg = m
+                break
+
     # Title (filename ya pehli line) — metadata caption ke liye
     title = ""
     if getattr(first, "file", None) and getattr(first.file, "name", None):
         title = apply_replacements(first.file.name)
-    elif first.message:
-        title = first.message.splitlines()[0][:80]
+    elif cap_msg.message:
+        title = cap_msg.message.splitlines()[0][:80]
 
     # Original formatting (bold/italic/links) preserve in HTML
-    raw_msg = first.message or ""
-    if raw_msg and getattr(first, "entities", None):
+    raw_msg = cap_msg.message or ""
+    if raw_msg and getattr(cap_msg, "entities", None):
         try:
-            formatted_orig = tl_html.unparse(raw_msg, first.entities)
+            formatted_orig = tl_html.unparse(raw_msg, cap_msg.entities)
         except Exception:
             formatted_orig = html.escape(raw_msg)
     else:
@@ -708,40 +869,47 @@ async def transfer_item(dest, chat_ref, msg_id, cfg=None, index=None):
     if not any(is_mediaable(m) for m in msgs):
         if get_setting("filter", "text") == "text":
             return "skip", "Text filtered out"
-        await _send_html_safe(client.send_message, dest_ent, text or "", reply_to=cfg.get("topic") or None)
+        await turbo_upload([], text, dest, cfg)
         return "ok", None
 
-    # 1) INSTANT path: bot-client file_id copy (unprotected content, zero download!)
-    if used_bot and not cfg.get("rename"):
+    is_restricted = bool(
+        getattr(first, "noforwards", False)
+        or getattr(chat_obj, "noforwards", False)
+    )
+
+    # 1) INSTANT path: bot-client file_id copy (jab restricted nahi hai aur rename nahi chahiye)
+    if used_bot and not is_restricted and not cfg.get("rename") and cfg.get("sender", "Bot") == "Bot":
         try:
             CURRENT["phase"] = "✨ Instant Copy"
             await instant_copy(dest, msgs, text, cfg)
             return "ok", None
         except ChatForwardsRestrictedError:
-            CURRENT["log"] = "Restricted mila — turbo engine on 🔥"
+            CURRENT["log"] = "Restricted content detected — Turbo Extractor ON 🔥"
         except Exception as e:
             log.info("Instant copy fail (%s) — turbo path try karo", e)
-        # Agar user session active hai to restricted fallback ke liye user_client se msgs fetch karo
         if fetcher is not client:
             try:
-                u_chat = await safe_call(fetcher.get_entity, resolve_for(fetcher, chat_ref))
+                u_chat = await smart_get_entity(fetcher, chat_ref)
                 u_msgs = await fetch_msg_group(fetcher, u_chat, msg_id)
                 if u_msgs:
                     msgs = u_msgs
+                    used_bot = False
             except Exception:
                 pass
 
-    # 2) TURBO path: per-item download + re-upload + instant disk cleanup
-    dl_client = fetcher if not used_bot or fetcher is not client else client
+    # 2) TURBO RESTRICTED EXTRACTOR path: download via user_client + HD streaming re-upload + auto disk cleanup
+    dl_client = fetcher if (not used_bot or fetcher is not client) else client
+    if is_restricted:
+        CURRENT["log"] = f"🔓 Extracting restricted #{msg_id}..."
     item_dir = os.path.join(DL_DIR, f"it_{msg_id}_{uuid.uuid4().hex[:6]}")
     try:
-        paths = await turbo_download(dl_client, msgs, item_dir, cfg=cfg)
-        if not paths:
+        items = await turbo_download(dl_client, msgs, item_dir, cfg=cfg)
+        if not items:
             if get_setting("filter", "text") == "text":
                 return "skip", "Text filtered out"
-            await _send_html_safe(client.send_message, dest_ent, text or "", reply_to=cfg.get("topic") or None)
+            await turbo_upload([], text, dest, cfg)
             return "ok", None
-        await turbo_upload(paths, text, dest, cfg)
+        await turbo_upload(items, text, dest, cfg)
         return "ok", None
     finally:
         shutil.rmtree(item_dir, ignore_errors=True)
@@ -991,15 +1159,18 @@ async def start_forward_flow(event, mode):
     uid = event.sender_id
     if not get_setting("target"):
         await event.reply(
-            "🎯 Pehle <code>/setchannel</code> se destination set karein.",
+            "🎯 Pehle destination set karein!\n"
+            "<code>/setchannel @channel</code> bhejo ya neeche button dabao:",
             parse_mode="html",
+            buttons=[[Button.inline("📥 Save to My Private Chat", b"save_private")]],
         )
         return
     if mode == "private" and not USER_ACTIVE:
         await event.reply(
-            "⚠️ Pehle <code>/login</code> se Telegram userbot connect karein.\n\n"
-            "Private/protected content ke liye user session chahiye 🔥",
+            "🔒 <b>Private / Restricted Content Mode</b>\n\n"
+            "Private channels ya <i>'Restrict saving content'</i> wale channels se extract karne ke liye pehle login karein 👇",
             parse_mode="html",
+            buttons=[[Button.inline("🔐 Login Now (Fast OTP)", b"menu_login")]],
         )
         return
     PANEL[uid] = {"step": "first", "mode": mode}
@@ -1011,7 +1182,7 @@ async def start_forward_flow(event, mode):
         )
     else:
         await event.reply(
-            "🔒 <b>PRIVATE FORWARD</b> — private/group/protected transfer (download flow)\n\n"
+            "🔒 <b>PRIVATE &amp; RESTRICTED FORWARD</b> — private/group/copy-protected extractor 🔥\n\n"
             "📩 <b>First Post Link</b> bhejo (jaise <code>t.me/c/1234567890/10</code>):",
             parse_mode="html",
         )
@@ -1036,7 +1207,7 @@ async def panel_buttons(event):
         await event.edit("⬅ <b>First Post Link</b> dobara bhejo:", parse_mode="html")
         return
     if action == "sender":
-        st["sender"] = "Anonymous" if st.get("sender", "Bot") == "Bot" else "Bot"
+        st["sender"] = "Userbot" if st.get("sender", "Bot") == "Bot" else "Bot"
         await event.answer(f"Sender: {st['sender']}")
         await show_panel(event, uid)
         return
@@ -1130,25 +1301,26 @@ async def handle_panel_input(event):
 #  COMMANDS                                                           #
 # ------------------------------------------------------------------ #
 def menu_kb():
+    login_btn = Button.inline("👤 Session Active ✅", b"menu_login") if USER_ACTIVE else Button.inline("🔐 Login (Fast OTP)", b"menu_login")
     return [
         [Button.inline("🚀 Start Forwarding", b"menu_start")],
-        [Button.inline("🔐 Login", b"menu_login"), Button.inline("🎯 Set Target", b"menu_target")],
-        [Button.inline("⚙️ Settings", b"menu_settings"), Button.inline("📊 Status", b"menu_status")],
-        [Button.inline("❓ Help", b"menu_help")],
+        [login_btn, Button.inline("🎯 Set Target", b"menu_target")],
+        [Button.inline("📋 My Private Chats", b"menu_chats"), Button.inline("📊 Status", b"menu_status")],
+        [Button.inline("⚙️ Settings", b"menu_settings"), Button.inline("❓ Help", b"menu_help")],
     ]
 
 def menu_text():
-    sess = "✅ Connected" if USER_ACTIVE else "❌ Not Connected"
+    sess = f"✅ Connected ({html.escape(USER_INFO)})" if USER_ACTIVE else "❌ Not Connected (Tap 🔐 Login)"
     tgt = get_setting("target", "")
     tgt_line = f"🎯 <b>Destination:</b> <code>{tgt}</code>" if tgt else "🎯 <b>Destination:</b> ❌ Not Set"
     return (
-        "🔥 <b>ULTRA HIGH-SPEED RESTRICTED-CONTENT EXTRACTOR</b> 🔥\n"
-        "<i>Bina kisi restriction ke… 100% Secure Sessions</i>\n\n"
+        "🔥 <b>ULTRA HIGH-SPEED RESTRICTED-CONTENT EXTRACTOR v5.0</b> 🔥\n"
+        "<i>Private Channels • Copy-Protected Content • 100% Secure Sessions</i>\n\n"
         f"👤 <b>Session:</b> {sess}\n"
         f"{tgt_line}\n"
-        f"⚡ <b>Engine:</b> TURBO | Workers: <b>{get_setting('workers', '2')}</b>\n"
+        f"⚡ <b>Engine:</b> TURBO HD | Workers: <b>{get_setting('workers', '2')}</b>\n"
         f"🔴 <b>Live Watch:</b> {len(get_watch_list())} routes\n\n"
-        "🚀 <b>Start Forwarding</b> dabao aur shuru karo!"
+        "💡 <i>Seedha link/range (<code>t.me/c/.../10-50</code>) ya TXT file bhi bhej sakte ho!</i>"
     )
 
 @client.on(events.NewMessage(pattern=r"^/start$|^/help$"))
@@ -1163,12 +1335,13 @@ async def menu_buttons(event):
         return
     action = event.pattern_match.group(1).decode()
     if action == "start":
+        await event.answer()
         await event.edit(
             "🚀 <b>START FORWARDING NOW</b>\n\n"
             "Apne source ke hisaab se mode choose karein:\n\n"
-            "🌐 <b>Public Forward</b> — public channel direct copy\n"
-            "🔒 <b>Private Forward</b> — private/group/protected transfer\n\n"
-            "<i>TIP: Public channel ke liye /publicforward, private link/group/protected download flow ke liye /forward use karein.</i>",
+            "🌐 <b>Public Forward</b> — public channel direct instant copy\n"
+            "🔒 <b>Private / Restricted Forward</b> — private channel, group, ya copy-protected content HD extractor\n\n"
+            "<i>TIP: Public channel ke liye /publicforward, aur private/restricted content ke liye /forward use karein.</i>",
             parse_mode="html",
             buttons=[
                 [Button.inline("🌐 Public · /publicforward", b"mode_public"), Button.inline("🔒 Private · /forward", b"mode_private")],
@@ -1176,9 +1349,14 @@ async def menu_buttons(event):
             ],
         )
     elif action == "home":
+        await event.answer()
         await event.edit(menu_text(), parse_mode="html", buttons=menu_kb())
     elif action == "login":
-        await event.edit("🔐 <code>/login</code> chalao — phone number se user session connect hoga.", parse_mode="html")
+        await event.answer()
+        await start_login_flow(event, edit=True)
+    elif action == "chats":
+        await event.answer("Loading chats...")
+        await cmd_chats(event)
     elif action == "target":
         await event.edit(
             "🎯 <b>DESTINATION TARGET SET KARO</b>\n\n"
@@ -1550,7 +1728,8 @@ async def cmd_watch(event):
         return
     fetcher = get_fetcher()
     try:
-        msgs = await safe_call(fetcher.get_messages, resolve_for(fetcher, src), limit=1)
+        src_ent = await smart_get_entity(fetcher, src)
+        msgs = await safe_call(fetcher.get_messages, src_ent, limit=1)
         if not msgs:
             raise ValueError
         lastids = get_lastids()
@@ -1559,8 +1738,9 @@ async def cmd_watch(event):
     except Exception:
         await event.reply(
             f"❌ <code>{src}</code> readable nahi!\n\nFix: bot ko admin banao, YA "
-            "<code>/login</code> se user session do 🔥",
+            "neeche button se <b>Login</b> karke apna account jodo 🔥",
             parse_mode="html",
+            buttons=[[Button.inline("🔐 Login Now", b"menu_login")]],
         )
         return
     wl = get_watch_list()
@@ -1603,138 +1783,594 @@ async def cmd_watchlist(event):
     await event.reply("\n".join(lines), parse_mode="html")
 
 # ------------------------------------------------------------------ #
-#  🔥 USER SESSION LOGIN                                              #
+#  🔥 ULTRA-FAST USER SESSION LOGIN (Keypad + Resend + Session)       #
 # ------------------------------------------------------------------ #
 LOGIN = {}
 
+def _new_login_client():
+    return TelegramClient(
+        StringSession(), API_ID, API_HASH,
+        device_model="Turbo Forwarder Pro",
+        system_version="Windows 11",
+        app_version="5.0.0",
+        lang_code="en",
+        system_lang_code="en-US",
+    )
+
+async def _close_login_tmp():
+    tmp = LOGIN.get("client")
+    if tmp:
+        try:
+            await tmp.disconnect()
+        except Exception:
+            pass
+    LOGIN.clear()
+
 async def init_user_client(session_str):
-    global user_client, USER_ACTIVE
+    global user_client, USER_ACTIVE, USER_INFO
     if user_client:
         try:
             await user_client.disconnect()
         except Exception:
             pass
-    user_client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
+    user_client = TelegramClient(
+        StringSession(session_str), API_ID, API_HASH,
+        device_model="Turbo Forwarder Pro",
+        system_version="Windows 11",
+        app_version="5.0.0",
+        lang_code="en",
+        system_lang_code="en-US",
+    )
     await user_client.connect()
     if await user_client.is_user_authorized():
         USER_ACTIVE = True
         me = await user_client.get_me()
-        log.info("🔥 USER session active: %s", me.first_name)
+        uname = f" @{me.username}" if getattr(me, "username", None) else ""
+        USER_INFO = f"{me.first_name or 'User'}{uname}"
+        log.info("🔥 USER session active: %s (id=%s)", USER_INFO, me.id)
+        # Warm up private channels/groups entity cache in background so t.me/c/... works immediately!
+        try:
+            dialogs = await user_client.get_dialogs(limit=None)
+            log.info("✅ Cached %d dialogs for private/restricted access", len(dialogs))
+        except Exception as e:
+            log.warning("Dialog cache warmup warn: %s", e)
         return True
     USER_ACTIVE = False
+    USER_INFO = ""
     log.warning("User session invalid/expired")
     return False
 
-async def finish_login(event, tmp):
+def _otp_kb():
+    return [
+        [Button.inline("1️⃣", b"lg_d1"), Button.inline("2️⃣", b"lg_d2"), Button.inline("3️⃣", b"lg_d3")],
+        [Button.inline("4️⃣", b"lg_d4"), Button.inline("5️⃣", b"lg_d5"), Button.inline("6️⃣", b"lg_d6")],
+        [Button.inline("7️⃣", b"lg_d7"), Button.inline("8️⃣", b"lg_d8"), Button.inline("9️⃣", b"lg_d9")],
+        [Button.inline("⌫ Back", b"lg_bk"), Button.inline("0️⃣", b"lg_d0"), Button.inline("✅ Verify", b"lg_ok")],
+        [Button.inline("🔁 Resend OTP", b"lg_resend"), Button.inline("✏️ Change Phone", b"lg_chg")],
+        [Button.inline("❌ Cancel Login", b"lg_cancel")],
+    ]
+
+def _otp_text(note=""):
+    phone = LOGIN.get("phone", "")
+    code_len = LOGIN.get("code_len", 5)
+    buf = LOGIN.get("buf", "")
+    via = LOGIN.get("via", "Official Telegram App Chat (777000)")
+    slots = [buf[i] if i < len(buf) else "•" for i in range(max(code_len, len(buf)))]
+    disp = " ".join(slots)
+    extra = f"\n\n{note}" if note else ""
+    return (
+        "🔐 <b>FAST OTP VERIFICATION</b>\n"
+        "<i>━━━━━━━━━━━━━━━━━━━━━━</i>\n"
+        f"📱 <b>Phone:</b> <code>{html.escape(phone)}</code>\n"
+        f"📨 <b>OTP Sent To:</b> {html.escape(via)}\n"
+        f"🔢 <b>OTP Code:</b> <code>{disp}</code>\n\n"
+        "👇 <b>Neeche Keypad buttons daba kar OTP enter karo!</b>\n"
+        "<i>(Keypad se code kabhi expire nahi hota aur 5th digit dabate hi auto-login ho jayega ⚡)</i>\n\n"
+        "💡 Type karna ho to space dekar bhejo: <code>1 2 3 4 5</code>\n"
+        "⚠️ <i>Bina space ke plain OTP mat bhejna, warna Telegram security ke liye code expire kar deta hai!</i>"
+        f"{extra}"
+    )
+
+def _describe_code_type(sent):
+    tname = type(getattr(sent, "type", None)).__name__.lower()
+    if "app" in tname:
+        return "Telegram App (Official 'Telegram' 777000 chat check karo!)"
+    if "sms" in tname:
+        return "SMS Message"
+    if "call" in tname:
+        return "Phone Call"
+    if "email" in tname:
+        return "Email"
+    return "Telegram App / SMS"
+
+async def start_login_flow(event, edit=False):
+    if USER_ACTIVE:
+        txt = (
+            "✅ <b>USER SESSION ALREADY ACTIVE!</b>\n\n"
+            f"👤 <b>Account:</b> {html.escape(USER_INFO)}\n"
+            "🔓 Private channels + Restricted (<i>no-forward</i>) content extraction READY hai! 🔥\n\n"
+            "Neeche se apne private channels dekh sakte ho ya naya account jodne ke liye Logout karo:"
+        )
+        kb = [
+            [Button.inline("📋 My Private Channels", b"menu_chats"), Button.inline("🔑 Backup Session", b"lg_export")],
+            [Button.inline("🚪 Logout Session", b"lg_logout")],
+            [Button.inline("⬅ Back to Menu", b"menu_home")],
+        ]
+        if edit:
+            await event.edit(txt, parse_mode="html", buttons=kb)
+        else:
+            await event.reply(txt, parse_mode="html", buttons=kb)
+        return
+
+    await _close_login_tmp()
+    LOGIN.update(step="phone", buf="")
+    txt = (
+        "🔐 <b>ULTRA-FAST TELEGRAM LOGIN</b>\n"
+        "<i>━━━━━━━━━━━━━━━━━━━━━━</i>\n"
+        "📞 Apna <b>Phone Number</b> country code ke saath abhi bhejo:\n\n"
+        "• India: <code>+919876543210</code>\n"
+        "• Bangladesh: <code>+8801343029369</code>\n"
+        "• Any Country: <code>+1...</code>\n\n"
+        "⚡ <i>Number bhejte hi turant OTP jayega aur Keypad khul jayega!</i>"
+    )
+    kb = [
+        [Button.inline("🔑 Login with StringSession", b"lg_sess")],
+        [Button.inline("❌ Cancel", b"lg_cancel")],
+    ]
+    if edit:
+        await event.edit(txt, parse_mode="html", buttons=kb)
+    else:
+        await event.reply(txt, parse_mode="html", buttons=kb)
+
+async def send_otp_to_phone(event, raw_phone, resend=False):
+    phone = re.sub(r"[\s\-()]", "", raw_phone.strip())
+    if not PHONE_RE.match(phone):
+        await event.reply(
+            "❌ Invalid format! Country code (<code>+</code>) ke saath number bhejo:\n"
+            "Example: <code>+8801343029369</code> ya <code>+919876543210</code>",
+            parse_mode="html",
+            buttons=[[Button.inline("❌ Cancel", b"lg_cancel")]],
+        )
+        return
+    status_msg = None
+    if not resend:
+        try:
+            await event.message.delete()
+        except Exception:
+            pass
+        status_msg = await client.send_message(
+            event.chat_id,
+            f"📡 <b>Sending OTP to</b> <code>{phone}</code> ...\n<i>Telegram server se connect ho raha hai ⚡</i>",
+            parse_mode="html",
+        )
+    try:
+        tmp = LOGIN.get("client")
+        if not tmp or not resend:
+            await _close_login_tmp()
+            tmp = _new_login_client()
+            await tmp.connect()
+        elif not tmp.is_connected():
+            await tmp.connect()
+
+        sent = await safe_call(tmp.send_code_request, phone)
+        code_len = getattr(getattr(sent, "type", None), "length", 5) or 5
+        via = _describe_code_type(sent)
+        LOGIN.update(
+            client=tmp,
+            step="code",
+            phone=phone,
+            phone_code_hash=sent.phone_code_hash,
+            code_len=code_len,
+            via=via,
+            buf="",
+        )
+        note = "🔁 <b>Fresh OTP bhej diya gaya hai!</b>" if resend else ""
+        if resend:
+            await event.edit(_otp_text(note), parse_mode="html", buttons=_otp_kb())
+        elif status_msg:
+            LOGIN["msg_id"] = status_msg.id
+            await status_msg.edit(_otp_text(note), parse_mode="html", buttons=_otp_kb())
+        else:
+            m = await event.reply(_otp_text(note), parse_mode="html", buttons=_otp_kb())
+            LOGIN["msg_id"] = m.id
+    except PhoneNumberInvalidError:
+        await _close_login_tmp()
+        err = "❌ <b>Phone number invalid hai!</b> Sahi Telegram registered number country code ke saath bhejo."
+        if status_msg:
+            await status_msg.edit(err, parse_mode="html", buttons=[[Button.inline("🔄 Retry Login", b"menu_login")]])
+        else:
+            await event.reply(err, parse_mode="html", buttons=[[Button.inline("🔄 Retry Login", b"menu_login")]])
+    except Exception as e:
+        await _close_login_tmp()
+        err = f"❌ <b>OTP Error:</b> <code>{html.escape(str(e))}</code>"
+        if status_msg:
+            await status_msg.edit(err, parse_mode="html", buttons=[[Button.inline("🔄 Retry Login", b"menu_login")]])
+        else:
+            await event.reply(err, parse_mode="html", buttons=[[Button.inline("🔄 Retry Login", b"menu_login")]])
+
+async def finish_login(chat_id, tmp, status_target=None):
     s = tmp.session.save()
     try:
         await tmp.disconnect()
     except Exception:
         pass
+    LOGIN.clear()
     set_setting("user_session", s)
     ok = await init_user_client(s)
-    LOGIN.clear()
     if ok:
-        await event.reply(
-            "✅ <b>Login Successful!</b>\n\n"
-            "🔥 <b>USER SESSION ACTIVE!</b>\n\n"
-            "✅ Public channels bina admin ke bhi read honge\n"
-            "✅ Restricted content save (jo aapko dikhta hai)\n"
-            "✅ Turbo engine ab full power pe hai ⚡\n\n"
-            "🔴 Ab /forward, /watch lagao ya txt file bhejo!",
+        priv_cnt = 0
+        try:
+            dialogs = await user_client.get_dialogs(limit=200)
+            priv_cnt = sum(1 for d in dialogs if d.is_channel or d.is_group)
+        except Exception:
+            pass
+        txt = (
+            "🎉 <b>LOGIN SUCCESSFUL!</b>\n"
+            "<i>━━━━━━━━━━━━━━━━━━━━━━</i>\n"
+            f"👤 <b>Connected Account:</b> {html.escape(USER_INFO)}\n"
+            f"📂 <b>Accessible Channels/Groups:</b> <b>{priv_cnt}</b> synced ✅\n\n"
+            "🔥 <b>UNLOCKED SUPERPOWERS:</b>\n"
+            "✅ Private Channels (<code>t.me/c/...</code>) full access\n"
+            "✅ <i>Restrict Saving Content</i> (No-Forward) HD Video/PDF extraction\n"
+            "✅ Original Thumbnail + Instant Video Streaming preserved\n"
+            "✅ Private Invite Links (<code>/join</code>) &amp; Bot Data (<code>/bottransfer</code>)\n\n"
+            "🚀 Ab seedha koi bhi private link bhejo ya neeche button dabao!"
+        )
+        kb = [
+            [Button.inline("🔒 Start Private Forward", b"mode_private")],
+            [Button.inline("📋 View My Private Channels", b"menu_chats")],
+            [Button.inline("🏠 Main Menu", b"menu_home")],
+        ]
+        if status_target:
+            try:
+                await status_target.edit(txt, parse_mode="html", buttons=kb)
+                return
+            except Exception:
+                pass
+        await client.send_message(chat_id, txt, parse_mode="html", buttons=kb)
+    else:
+        await client.send_message(chat_id, "⚠️ Session authorize nahi ho paya. /login se dobara try karein.")
+
+async def _verify_otp_code(chat_id, code, status_target=None):
+    tmp = LOGIN.get("client")
+    if not tmp:
+        await client.send_message(chat_id, "⚠️ Login session expire ho gaya — /login se dobara shuru karo.")
+        return
+    if not tmp.is_connected():
+        await tmp.connect()
+    try:
+        await tmp.sign_in(
+            phone=LOGIN["phone"],
+            code=code,
+            phone_code_hash=LOGIN.get("phone_code_hash"),
+        )
+    except SessionPasswordNeededError:
+        LOGIN["step"] = "password"
+        LOGIN["buf"] = ""
+        txt = (
+            "🔐 <b>2-STEP VERIFICATION (2FA) PASSWORD</b>\n\n"
+            "Aapke Telegram account par 2FA password laga hai.\n"
+            "👇 Apna <b>Cloud Password</b> abhi type karke bhejo:\n\n"
+            "<i>(Security ke liye aapka password message turant auto-delete ho jayega 🔒)</i>"
+        )
+        kb = [[Button.inline("❌ Cancel Login", b"lg_cancel")]]
+        if status_target:
+            try:
+                await status_target.edit(txt, parse_mode="html", buttons=kb)
+                return
+            except Exception:
+                pass
+        await client.send_message(chat_id, txt, parse_mode="html", buttons=kb)
+        return
+    except (PhoneCodeInvalidError, PhoneCodeEmptyError):
+        LOGIN["buf"] = ""
+        txt = _otp_text("❌ <b>Galat OTP code!</b> Dobara sahi digits tap karo:")
+        if status_target:
+            try:
+                await status_target.edit(txt, parse_mode="html", buttons=_otp_kb())
+                return
+            except Exception:
+                pass
+        await client.send_message(chat_id, txt, parse_mode="html", buttons=_otp_kb())
+        return
+    except PhoneCodeExpiredError:
+        LOGIN["buf"] = ""
+        txt = _otp_text(
+            "⏰ <b>OTP Expire ho gaya!</b>\n"
+            "<i>(Plain OTP chat me likhne se Telegram code expire kar deta hai — neeche <b>🔁 Resend OTP</b> dabao aur Keypad buttons use karo!)</i>"
+        )
+        if status_target:
+            try:
+                await status_target.edit(txt, parse_mode="html", buttons=_otp_kb())
+                return
+            except Exception:
+                pass
+        await client.send_message(chat_id, txt, parse_mode="html", buttons=_otp_kb())
+        return
+    except Exception as e:
+        await _close_login_tmp()
+        await client.send_message(
+            chat_id,
+            f"❌ <b>Login Failed:</b> <code>{html.escape(str(e))}</code>",
+            parse_mode="html",
+            buttons=[[Button.inline("🔄 Try Again", b"menu_login")]],
+        )
+        return
+
+    await finish_login(chat_id, tmp, status_target=status_target)
+
+@client.on(events.CallbackQuery(pattern=b"lg_(.+)"))
+async def login_callbacks(event):
+    if not is_owner(event.sender_id):
+        await event.answer("⛔ Sirf owner!", alert=True)
+        return
+    act = event.pattern_match.group(1).decode()
+
+    if act == "cancel":
+        await _close_login_tmp()
+        await event.answer("Login cancelled")
+        await event.edit("❌ <b>Login cancel kar diya gaya.</b>", parse_mode="html", buttons=[[Button.inline("🏠 Main Menu", b"menu_home")]])
+        return
+
+    if act == "logout":
+        global user_client, USER_ACTIVE, USER_INFO
+        if user_client:
+            try:
+                await user_client.disconnect()
+            except Exception:
+                pass
+        user_client = None
+        USER_ACTIVE = False
+        USER_INFO = ""
+        set_setting("user_session", "")
+        await event.answer("Logged out!")
+        await event.edit("✅ <b>User session disconnect ho gaya.</b>", parse_mode="html", buttons=[[Button.inline("🔐 Login Again", b"menu_login"), Button.inline("🏠 Menu", b"menu_home")]])
+        return
+
+    if act == "export":
+        s = get_setting("user_session", "") or os.environ.get("USER_SESSION", "")
+        if not s:
+            await event.answer("Session nahi mila!", alert=True)
+            return
+        await event.answer("Session sent below!")
+        await client.send_message(
+            event.chat_id,
+            "🔑 <b>YOUR BACKUP STRING SESSION</b> (Kisi ke saath share mat karna!):\n\n"
+            f"<code>{s}</code>\n\n"
+            "<i>Kabhi bhi <code>/session &lt;string&gt;</code> se 1 sec me login kar sakte ho.</i>",
             parse_mode="html",
         )
-    else:
-        await event.reply("⚠️ Session save hua par authorize nahi. /login dobara.")
+        return
+
+    if act == "sess":
+        await _close_login_tmp()
+        LOGIN.update(step="session_str")
+        await event.answer()
+        await event.edit(
+            "🔑 <b>LOGIN VIA TELETHON STRING SESSION</b>\n\n"
+            "Apna Telethon <b>StringSession</b> paste karke bhejo:\n"
+            "<i>(Message turant delete ho jayega aur 1 second me login ho jayega ⚡)</i>",
+            parse_mode="html",
+            buttons=[[Button.inline("⬅ Back to Phone Login", b"menu_login"), Button.inline("❌ Cancel", b"lg_cancel")]],
+        )
+        return
+
+    if act == "chg":
+        await start_login_flow(event, edit=True)
+        return
+
+    if LOGIN.get("step") != "code":
+        await event.answer("Session active nahi hai — Login dabayein", alert=True)
+        return
+
+    if act == "resend":
+        await event.answer("Sending fresh OTP...")
+        await send_otp_to_phone(event, LOGIN["phone"], resend=True)
+        return
+
+    buf = LOGIN.get("buf", "")
+    code_len = LOGIN.get("code_len", 5)
+
+    if act.startswith("d") and act[1:].isdigit():
+        if len(buf) < 8:
+            buf += act[1:]
+            LOGIN["buf"] = buf
+        if len(buf) >= code_len:
+            await event.answer("⚡ Verifying OTP...")
+            await event.edit(_otp_text("⏳ <b>Verifying OTP with Telegram...</b>"), parse_mode="html")
+            await _verify_otp_code(event.chat_id, buf, status_target=event)
+            return
+        await event.answer(f"OTP: {buf}")
+        await event.edit(_otp_text(), parse_mode="html", buttons=_otp_kb())
+        return
+
+    if act == "bk":
+        LOGIN["buf"] = buf[:-1]
+        await event.answer()
+        await event.edit(_otp_text(), parse_mode="html", buttons=_otp_kb())
+        return
+
+    if act == "ok":
+        if len(buf) < 4:
+            await event.answer("Pehle pura OTP enter karo!", alert=True)
+            return
+        await event.answer("⚡ Verifying OTP...")
+        await event.edit(_otp_text("⏳ <b>Verifying OTP with Telegram...</b>"), parse_mode="html")
+        await _verify_otp_code(event.chat_id, buf, status_target=event)
+        return
 
 async def handle_login_step(event):
     raw = (event.raw_text or "").strip()
     step = LOGIN.get("step")
-    tmp = LOGIN.get("client")
-    if step == "phone":
-        phone = raw.replace(" ", "").replace("-", "")
-        if not phone.startswith("+"):
-            await event.reply("📞 <code>+91...</code> format me bhejo:", parse_mode="html")
-            return
-        try:
-            await safe_call(tmp.send_code_request, phone)
-            LOGIN.update(step="code", phone=phone)
-            try:
-                await event.message.delete()
-            except Exception:
-                pass
-            await event.reply(
-                "📨 Code official Telegram app me aaya (bot pe nahi)!\n"
-                "Code bhejo (spaces me bhi chalega — jaise <code>1 2 3 4 5</code>):",
-                parse_mode="html",
-            )
-        except Exception as e:
-            LOGIN.clear()
-            await event.reply(f"❌ Fail: <code>{e}</code>\n/login se dobara.", parse_mode="html")
-    elif step == "code":
-        code = raw.replace(" ", "")
-        try:
-            await tmp.sign_in(phone=LOGIN["phone"], code=code)
-        except SessionPasswordNeededError:
-            LOGIN["step"] = "password"
-            try:
-                await event.message.delete()
-            except Exception:
-                pass
-            await event.reply(
-                "🔐 <b>Enter 2FA Password!</b>\nExample: <code>mypassword123</code>\n\n"
-                "<i>(Turant delete kar dunga)</i>",
-                parse_mode="html",
-            )
-            return
-        except (PhoneCodeInvalidError, PhoneCodeEmptyError):
-            await event.reply("❌ Galat code! Dobara bhejo:")
-            return
-        except Exception as e:
-            LOGIN.clear()
-            await event.reply(f"❌ Login fail: <code>{e}</code>", parse_mode="html")
-            return
+    if step == "session_str":
         try:
             await event.message.delete()
         except Exception:
             pass
-        await finish_login(event, tmp)
-    elif step == "password":
+        LOGIN.clear()
+        ok = await init_user_client(raw)
+        if ok:
+            set_setting("user_session", raw)
+            await event.reply(f"✅ <b>StringSession Connected!</b> ({html.escape(USER_INFO)}) 🔥", parse_mode="html", buttons=menu_kb())
+        else:
+            await event.reply("❌ Invalid/Expired StringSession! Phone OTP se login karein:", buttons=[[Button.inline("🔐 Phone Login", b"menu_login")]])
+        return
+
+    if step == "phone":
+        await send_otp_to_phone(event, raw)
+        return
+
+    if step == "code":
+        # Extract 4-8 digits even if spaced/hyphenated or inside forwarded Telegram text
+        m = re.search(r"(?:code[:\s]+)?(\d(?:[\s\-]*\d){3,7})", raw, re.IGNORECASE)
+        digits = re.sub(r"\D", "", m.group(1)) if m else re.sub(r"\D", "", raw)
+        try:
+            await event.message.delete()
+        except Exception:
+            pass
+        if len(digits) < 4:
+            await event.reply("🔢 OTP ke digits nahi mile — upar Keypad buttons tap karo ya <code>1 2 3 4 5</code> bhejo!", parse_mode="html")
+            return
+        await _verify_otp_code(event.chat_id, digits)
+        return
+
+    if step == "password":
         pwd = raw
+        tmp = LOGIN.get("client")
+        try:
+            await event.message.delete()
+        except Exception:
+            pass
+        if not tmp:
+            await event.reply("⚠️ Login timeout — /login dobara karein.")
+            return
+        if not tmp.is_connected():
+            await tmp.connect()
         try:
             await tmp.sign_in(password=pwd)
-        except Exception as e:
-            await event.reply(f"❌ Galat: <code>{e}</code>\nDobara ya /cancellogin:")
+        except PasswordHashInvalidError:
+            await event.reply(
+                "❌ <b>Galat 2FA Password!</b> Dobara sahi Cloud Password bhejo:",
+                parse_mode="html",
+                buttons=[[Button.inline("❌ Cancel", b"lg_cancel")]],
+            )
             return
-        try:
-            await event.message.delete()
-        except Exception:
-            pass
-        await finish_login(event, tmp)
+        except Exception as e:
+            await event.reply(
+                f"❌ <b>2FA Error:</b> <code>{html.escape(str(e))}</code>\nDobara bhejo ya Cancel karo:",
+                parse_mode="html",
+                buttons=[[Button.inline("❌ Cancel", b"lg_cancel")]],
+            )
+            return
+        await finish_login(event.chat_id, tmp)
 
-@client.on(events.NewMessage(pattern=r"^/login$"))
+@client.on(events.NewMessage(pattern=r"^/login(?:\s+(.+))?$"))
 @owner_filter
 async def cmd_login(event):
-    if USER_ACTIVE:
-        await event.reply("✅ Already active! /logout pehle karo.")
+    arg = (event.pattern_match.group(1) or "").strip()
+    if arg and not USER_ACTIVE:
+        await send_otp_to_phone(event, arg)
         return
-    if LOGIN:
-        await event.reply("⏳ Login chal raha hai — phone/code/password bhejo ya /cancellogin.")
+    await start_login_flow(event, edit=False)
+
+@client.on(events.NewMessage(pattern=r"^/session\s+(.+)$"))
+@owner_filter
+async def cmd_session_import(event):
+    s = event.pattern_match.group(1).strip()
+    try:
+        await event.message.delete()
+    except Exception:
+        pass
+    ok = await init_user_client(s)
+    if ok:
+        set_setting("user_session", s)
+        await client.send_message(event.chat_id, f"✅ <b>StringSession Active!</b> ({html.escape(USER_INFO)}) 🔥", parse_mode="html", buttons=menu_kb())
+    else:
+        await client.send_message(event.chat_id, "❌ Invalid StringSession! <code>/login</code> se OTP login karein.", parse_mode="html")
+
+@client.on(events.NewMessage(pattern=r"^/exportsession$"))
+@owner_filter
+async def cmd_export_session(event):
+    s = get_setting("user_session", "") or os.environ.get("USER_SESSION", "")
+    if not s:
+        await event.reply("❌ Koi active user session nahi hai. Pehle /login karein.")
         return
-    tmp = TelegramClient(StringSession(), API_ID, API_HASH)
-    await tmp.connect()
-    LOGIN["client"] = tmp
-    LOGIN["step"] = "phone"
     await event.reply(
-        "🔥 <b>USER SESSION LOGIN</b>\n\nPhone number bhejo (<code>+919876543210</code>):\n\n"
-        "🔐 <i>Session sirf aapke bot me store hoga. Phone/code turant delete hoga.</i>",
+        "🔑 <b>YOUR STRING SESSION</b> (Private rakhein!):\n\n"
+        f"<code>{s}</code>",
         parse_mode="html",
     )
+
+@client.on(events.NewMessage(pattern=r"^/chats$|^/dialogs$"))
+@owner_filter
+async def cmd_chats(event):
+    """Joined private/public channels & groups list with -100 IDs and Restricted tags."""
+    if not USER_ACTIVE or not user_client:
+        await event.reply(
+            "🔒 Apne private channels dekhne ke liye pehle Login karein:",
+            buttons=[[Button.inline("🔐 Login Now", b"menu_login")]],
+        )
+        return
+    dialogs = await safe_call(user_client.get_dialogs, limit=60)
+    rows = []
+    for d in dialogs:
+        if d.is_channel or d.is_group:
+            ent = d.entity
+            cid = f"-100{ent.id}" if getattr(ent, "broadcast", False) or getattr(ent, "megagroup", False) else str(-ent.id)
+            lock = "🔒" if getattr(ent, "noforwards", False) else ("🔐" if not getattr(ent, "username", None) else "🌐")
+            title = html.escape((d.name or "Untitled")[:34])
+            rows.append(f"{lock} <b>{title}</b>\n   └ ID: <code>{cid}</code>")
+            if len(rows) >= 25:
+                break
+    if not rows:
+        await event.reply("Koi channel/group nahi mila.")
+        return
+    txt = (
+        f"📋 <b>YOUR CHANNELS &amp; GROUPS ({len(rows)} shown)</b>\n"
+        "<i>🔒 = Copy-Restricted | 🔐 = Private | 🌐 = Public</i>\n\n"
+        + "\n".join(rows)
+        + "\n\n💡 <i>Kisi bhi private channel ke post ka link copy karke seedha yahan bhej do — restricted content bhi forward ho jayega!</i>"
+    )
+    await event.reply(txt[:4000], parse_mode="html")
+
+@client.on(events.NewMessage(pattern=r"^/join\s+(.+)$"))
+@owner_filter
+async def cmd_join(event):
+    """Join a private channel invite link via user_client."""
+    if not USER_ACTIVE or not user_client:
+        await event.reply(
+            "🔒 Private invite link join karne ke liye pehle Login karein:",
+            buttons=[[Button.inline("🔐 Login Now", b"menu_login")]],
+        )
+        return
+    arg = event.pattern_match.group(1).strip()
+    m = INVITE_RE.search(arg)
+    if not m:
+        await event.reply("Format: <code>/join https://t.me/+AbCdEfGh...</code>", parse_mode="html")
+        return
+    inv_hash = m.group(1)
+    try:
+        upd = await safe_call(user_client, ImportChatInviteRequest(inv_hash))
+        chat = upd.chats[0] if getattr(upd, "chats", None) else None
+        cid = f"-100{chat.id}" if chat else "joined"
+        title = getattr(chat, "title", "Private Chat")
+        await event.reply(
+            f"✅ <b>Joined Successfully!</b>\n📛 <b>{html.escape(title)}</b>\n🆔 ID: <code>{cid}</code>\n\n"
+            "Ab is channel ke post links seedha bhej kar extract kar sakte ho! 🔥",
+            parse_mode="html",
+        )
+    except UserAlreadyParticipantError:
+        await user_client.get_dialogs(limit=100)
+        await event.reply("✅ Aapka account is private channel me pehle se joined hai! Seedha post link bhejo 🔥")
+    except (InviteHashExpiredError, InviteHashInvalidError):
+        await event.reply("❌ Invite link invalid ya expire ho chuka hai!")
+    except Exception as e:
+        await event.reply(f"❌ Join fail: <code>{html.escape(str(e))}</code>", parse_mode="html")
 
 @client.on(events.NewMessage(pattern=r"^/logout$"))
 @owner_filter
 async def cmd_logout(event):
-    global user_client, USER_ACTIVE
+    global user_client, USER_ACTIVE, USER_INFO
     if not USER_ACTIVE:
         await event.reply("Koi user session active nahi.")
         return
@@ -1744,6 +2380,7 @@ async def cmd_logout(event):
         pass
     user_client = None
     USER_ACTIVE = False
+    USER_INFO = ""
     set_setting("user_session", "")
     await event.reply("✅ User session hata diya.")
 
@@ -1751,11 +2388,7 @@ async def cmd_logout(event):
 @owner_filter
 async def cmd_cancellogin(event):
     if LOGIN:
-        try:
-            await LOGIN.get("client").disconnect()
-        except Exception:
-            pass
-        LOGIN.clear()
+        await _close_login_tmp()
         await event.reply("🧹 Login cancel.")
     else:
         await event.reply("Koi login chal nahi raha.")
@@ -1777,8 +2410,8 @@ async def cmd_grouptransfer(event):
         return
     fetcher = get_fetcher()
     try:
-        src_chat = await safe_call(fetcher.get_entity, resolve_for(fetcher, src))
-        dst_chat = await safe_call(client.get_entity, resolve_for(client, target))
+        src_chat = await smart_get_entity(fetcher, src)
+        dst_chat = await smart_get_entity(user_client, target) if USER_ACTIVE and user_client and str(target).startswith("-100") else await safe_call(client.get_entity, resolve_for(client, target))
     except Exception as e:
         await event.reply(f"❌ Chat access nahi: <code>{e}</code>\nBot ko admin banao ya /login karo.", parse_mode="html")
         return
@@ -1913,17 +2546,51 @@ async def handle_bottransfer_input(event):
 # ------------------------------------------------------------------ #
 @client.on(events.NewMessage(func=lambda e: e.is_private and is_owner(e.sender_id)))
 async def catch_all(event):
+    raw = (event.raw_text or "").strip()
+    if raw.startswith("/"):
+        return
+
     if LOGIN:
         await handle_login_step(event)
         return
+
+    # Auto-detect phone number (+880... / +91...) even if user didn't tap /login first!
+    cleaned_phone = re.sub(r"[\s\-()]", "", raw)
+    if PHONE_RE.match(cleaned_phone) and not USER_ACTIVE and event.sender_id not in PANEL:
+        await send_otp_to_phone(event, cleaned_phone)
+        return
+
     # Panel flow input?
     if event.sender_id in PANEL:
         if await handle_panel_input(event):
             return
         if await handle_bottransfer_input(event):
             return
-    raw = event.raw_text or ""
-    if raw.strip().startswith("/"):
+
+    # Auto-detect private invite link (t.me/+... or t.me/joinchat/...)
+    inv_m = INVITE_RE.search(raw)
+    if inv_m and not parse_all_links(raw):
+        if not USER_ACTIVE or not user_client:
+            await event.reply(
+                "🔒 Private invite link mila! Pehle Login karein taaki aapka account join/extract kar sake:",
+                buttons=[[Button.inline("🔐 Login Now", b"menu_login")]],
+            )
+            return
+        try:
+            upd = await safe_call(user_client, ImportChatInviteRequest(inv_m.group(1)))
+            chat = upd.chats[0] if getattr(upd, "chats", None) else None
+            cid = f"-100{chat.id}" if chat else "joined"
+            title = getattr(chat, "title", "Private Chat")
+            await event.reply(
+                f"✅ <b>Private Channel Joined!</b>\n📛 <b>{html.escape(title)}</b>\n🆔 ID: <code>{cid}</code>\n\n"
+                "Ab post link ya range (<code>t.me/c/.../1-50</code>) bhej do! 🔥",
+                parse_mode="html",
+            )
+        except UserAlreadyParticipantError:
+            await user_client.get_dialogs(limit=100)
+            await event.reply("✅ Pehle se joined hai! Seedha post link bhejo 🔥")
+        except Exception as e:
+            await event.reply(f"❌ Invite join error: <code>{html.escape(str(e))}</code>", parse_mode="html")
         return
 
     # txt file
@@ -1940,23 +2607,43 @@ async def catch_all(event):
             if not links:
                 await event.reply("🤔 Is txt me koi valid post link nahi mila!")
                 return
+            if any(str(c).startswith("-100") for c, _ in links) and not USER_ACTIVE:
+                await event.reply(
+                    f"📄 <b>{html.escape(name)}</b> me private channel links hain!\n"
+                    "Pehle neeche button se Login karein phir file dobara bhejein 👇",
+                    parse_mode="html",
+                    buttons=[[Button.inline("🔐 Login Now", b"menu_login")]],
+                )
+                return
             await event.reply(
-                f"📄 <b>{name}</b> me <b>{len(links)}</b> links mile!\n"
+                f"📄 <b>{html.escape(name)}</b> me <b>{len(links)}</b> links mile!\n"
                 "👑 TURBO TRANSFER shuru... 🚀",
                 parse_mode="html",
             )
             await run_job(event, links, name)
             return
 
-    # auto-detect links
+    # auto-detect links (single, multiple, or range t.me/c/.../10-50)
     links = parse_all_links(raw)
     if links:
-        links = links[:100]
+        links = links[:2000]
         if not get_setting("target"):
-            await event.reply("🎯 Links mile! Pehle target set karo: <code>/settarget @channel</code>", parse_mode="html")
+            await event.reply(
+                "🎯 Links mile! Pehle target set karo: <code>/setchannel @channel</code> ya neeche button dabao:",
+                parse_mode="html",
+                buttons=[[Button.inline("📥 Save to My Private Chat", b"save_private")]],
+            )
             return
-        await event.reply(f"⚡ <b>{len(links)}</b> links pakde — TURBO transfer! 🚀", parse_mode="html")
-        await run_job(event, links, f"auto-detect ({len(links)} links)")
+        if any(str(c).startswith("-100") for c, _ in links) and not USER_ACTIVE:
+            await event.reply(
+                "🔒 <b>Private / Restricted Channel Link Detected!</b>\n\n"
+                "Private channel se restricted videos/PDFs nikalne ke liye pehle 10 second me Login karein 👇",
+                parse_mode="html",
+                buttons=[[Button.inline("🔐 Login Now (Fast OTP)", b"menu_login")]],
+            )
+            return
+        await event.reply(f"⚡ <b>{len(links)}</b> posts pakde — TURBO EXTRACTOR ON! 🚀", parse_mode="html")
+        await run_job(event, links, f"auto ({len(links)} posts)")
 
 # --- /save explicit ---
 @client.on(events.NewMessage(pattern=r"^/save\s+(.+)$"))
@@ -2007,7 +2694,8 @@ async def poll_source(src, target, delay):
     lastids = get_lastids()
     last = lastids.get(src, 0)
     try:
-        msgs = await safe_call(fetcher.get_messages, resolve_for(fetcher, src), limit=10)
+        src_ent = await smart_get_entity(fetcher, src)
+        msgs = await safe_call(fetcher.get_messages, src_ent, limit=10)
     except (ChannelPrivateError, ValueError):
         return
     except Exception as e:
@@ -2092,7 +2780,7 @@ async def keepalive_loop():
 #  HTTP HEALTH SERVER                                                 #
 # ------------------------------------------------------------------ #
 async def health_handler(_request):
-    return web.json_response({"status": "ok", "bot": "turbo-transfer", "v": "4.0"})
+    return web.json_response({"status": "ok", "bot": "turbo-transfer", "v": "5.0"})
 
 def run_http_server():
     loop = asyncio.new_event_loop()
@@ -2126,10 +2814,12 @@ async def main():
             lang_code="",
             commands=[
                 BotCommand("start", "Main menu & dashboard"),
-                BotCommand("publicforward", "Public channel direct copy"),
-                BotCommand("forward", "Private/group/protected transfer"),
+                BotCommand("login", "Fast OTP / Session login"),
+                BotCommand("forward", "Private & restricted content extractor"),
+                BotCommand("publicforward", "Public channel instant copy"),
+                BotCommand("chats", "List joined private/restricted channels"),
+                BotCommand("join", "Join private channel invite link"),
                 BotCommand("setchannel", "Set destination channel/chat"),
-                BotCommand("login", "Connect user session"),
                 BotCommand("watch", "Live 24/7 auto-forward"),
                 BotCommand("grouptransfer", "Full forum/group topic transfer"),
                 BotCommand("bottransfer", "Extract messages from another bot"),
@@ -2138,9 +2828,7 @@ async def main():
                 BotCommand("stop", "Instant stop & save state"),
                 BotCommand("id", "Get Chat, Topic & User ID"),
                 BotCommand("settings", "View engine settings"),
-                BotCommand("myplan", "Check plan status"),
-                BotCommand("cleanup_ram", "Clear temp cache"),
-                BotCommand("dyno_status", "Server health & uptime"),
+                BotCommand("exportsession", "Backup your StringSession"),
                 BotCommand("reset", "Refresh settings"),
                 BotCommand("logout", "Disconnect user session"),
             ],
@@ -2148,6 +2836,9 @@ async def main():
         log.info("✅ Telegram command menu registered")
     except Exception as e:
         log.warning("Command menu setup skipped: %s", e)
+
+    if not get_setting("target") and OWNER_ID:
+        set_setting("target", str(OWNER_ID))
 
     session_str = os.environ.get("USER_SESSION", "") or get_setting("user_session", "")
     if session_str:
@@ -2180,6 +2871,20 @@ async def main():
                 type("E", (), {"reply": lambda self, *a, **k: client.send_message(OWNER_ID, *a, **k)})(),
                 resume=pend,
             ))
+    else:
+        try:
+            await client.send_message(
+                OWNER_ID,
+                "⚡ <b>TURBO EXTRACTOR v5.0 LIVE &amp; UPGRADED!</b>\n\n"
+                "✅ <b>Fast Keypad OTP Login</b> Ready\n"
+                "✅ <b>Private + Restricted Content HD Extractor</b> Ready\n"
+                f"🎯 <b>Default Target:</b> <code>{get_setting('target')}</code> (My Private Chat)\n\n"
+                "👇 Neeche <b>🔐 Login (Fast OTP)</b> dabao, ya seedha apna phone number (<code>+880...</code> / <code>+91...</code>) bhej do!",
+                parse_mode="html",
+                buttons=menu_kb(),
+            )
+        except Exception as e:
+            log.info("Startup owner notify skipped: %s", e)
 
     await client.run_until_disconnected()
 
