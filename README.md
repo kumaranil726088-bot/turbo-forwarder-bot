@@ -252,3 +252,9 @@ native candidates without downloader calls, checkpoint retarget/cursor preservat
 source/destination same-client planning, and per-user isolation tested with mocks.
 No sandbox login using private saved-user sessions and no live private-user channel
 send performed for this release. Production state is restored, never reseeded.
+
+V6.5.1 preservation guard: a new deployment default is not treated as an explicit
+user sender edit when an old paused job has a distinct panel-selected sender.
+This preserves historical explicit User/Saved Messages panel jobs on ordinary
+/resume. An explicitly stored /setsender auto still overrides that panel choice;
+/resume latest remains the deliberate all-current-settings option.168 tests pass.

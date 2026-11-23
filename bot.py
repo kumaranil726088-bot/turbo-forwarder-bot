@@ -43,7 +43,7 @@ from transfer import Parallel, TYPES, parse_links, parse_post_link, source_ref, 
 from dotenv import load_dotenv
 load_dotenv()
 
-VERSION = '6.5'
+VERSION = '6.5.1'
 START = time.time()
 API_ID = int(os.getenv('API_ID','0'))
 API_HASH = os.getenv('API_HASH','')
@@ -1275,6 +1275,10 @@ async def command(e,cmd,arg):
             baseline=saved_cfg.get('_settings_baseline')
             for key in ('sender','mode','workers','connections','delay','filter','type_filters'):
                 current=DB.get(uid,key)
+                # A deployment default is not a user's explicit sender change.
+                # Retain historical panel overrides (notably private Saved Messages).
+                if key=='sender' and baseline and not DB.has_setting(uid,key) and saved_cfg.get(key) not in (None,baseline.get(key)):
+                    continue
                 if baseline is None or current!=baseline.get(key):saved_cfg[key]=current
         return await start_job(e,pending['links'],saved_cfg,pending.get('start',pending.get('idx',0)),pending.get('topic_map'),stats=pending.get('stats'))
     if cmd == 'why':

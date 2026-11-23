@@ -121,6 +121,17 @@ class AutoSenderTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ValueError):await bot.command(Event(2),'setchannel','@new')
         self.assertIsNone(bot.DB.get(2,'target'));bot.JOBS.clear()
 
+    async def test_explicit_global_auto_choice_overrides_old_panel_sender_on_resume(self):
+        bot.DB.set(2,'sender','Auto')
+        bot.DB.set(2,'pending_job',{'links':[['abc',1]],'start':0,'cfg':{'target':'@dest','sender':'User','_settings_baseline':{'sender':'Bot'}}})
+        with patch('bot.start_job',AsyncMock()) as start:await bot.command(Event(2),'resume','')
+        self.assertEqual(start.call_args.args[2]['sender'],'Auto')
+    async def test_old_default_bot_inherits_auto_but_destination_does_not_change(self):
+        bot.DB.set(2,'pending_job',{'links':[['abc',1]],'start':0,'cfg':{'target':'@dest','sender':'Bot','_settings_baseline':{'sender':'Bot'}}})
+        with patch('bot.start_job',AsyncMock()) as start:await bot.command(Event(2),'resume','')
+        self.assertEqual(start.call_args.args[2]['sender'],'Auto')
+        self.assertEqual(start.call_args.args[2]['target'],'@dest')
+
     async def test_cycle_includes_all_three_sender_choices(self):
         self.assertEqual(bot.cycle_sender('Auto'),'User');self.assertEqual(bot.cycle_sender('User'),'Bot')
         self.assertEqual(bot.cycle_sender('Bot'),'Auto')

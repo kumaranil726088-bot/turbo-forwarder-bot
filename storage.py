@@ -68,6 +68,8 @@ class Store:
                 raise RuntimeError('SESSION_KEY missing')
             return self.cipher.decrypt(value.encode()).decode()
         return value
+    def has_setting(self,uid,key):
+        return self.db.execute('SELECT 1 FROM user_settings WHERE uid=? AND key=?',(uid,key)).fetchone() is not None
     def set(self, uid, key, value):
         if key == 'session' and value:
             if not self.cipher:
