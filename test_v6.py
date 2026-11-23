@@ -138,6 +138,10 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
     async def test_private_source_requires_login(self):
         with self.assertRaises(ValueError):await bot.fetcher(2,'-100123')
         with self.assertRaises(ValueError):await bot.destination_entity(2,{'target':'@channel'})
+    async def test_bot_source_cannot_read_private_conversations(self):
+        with patch('bot.entity',AsyncMock(return_value=NS(username='someuser',id=123))):
+            with self.assertRaises(ValueError):await bot.fetcher(2,'someuser')
+
     async def test_session_identity(self):
         cl=AsyncMock();cl.is_user_authorized.return_value=True;cl.get_me.return_value=NS(id=999)
         with patch('bot.TelegramClient',return_value=cl):

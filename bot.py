@@ -25,7 +25,7 @@ from telethon.extensions import html as tl_html
 from telethon.tl.functions.bots import SetBotCommandsRequest
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest, GetForumTopicsRequest, CreateForumTopicRequest
-from telethon.tl.types import BotCommand, BotCommandScopeDefault, DocumentAttributeFilename
+from telethon.tl.types import BotCommand, BotCommandScopeDefault, DocumentAttributeFilename, Channel
 from telethon.errors import SessionPasswordNeededError, FloodWaitError
 
 from storage import Store, DEFAULTS
@@ -118,8 +118,8 @@ async def fetcher(uid,src):
     if str(src).lstrip('-').isdigit():
         raise ValueError('Private sources require your own /login and channel membership')
     ent = await entity(BOT,src)
-    if not getattr(ent,'username',None):
-        raise ValueError('Log in to access non-public sources')
+    if not isinstance(ent,Channel) or not getattr(ent,'username',None):
+        raise ValueError('Without login, sources must be public channels/supergroups, never bot private conversations')
     return BOT
 
 
@@ -415,7 +415,9 @@ async def start_job(e,links,cfg=None,start=0,topic_map=None):
         return await respond(e,'Your job is already running. /stop first.')
     if not links or len(links)>10000:
         raise ValueError('Choose between 1 and 10,000 posts')
-    cfg = cfg or cfg_for(uid)
+    complete_cfg = cfg_for(uid)
+    complete_cfg.update(cfg or {})
+    cfg = complete_cfg
     card = await respond(e,'⚡ Validating your destination and starting your isolated queue…')
     JOBS[uid] = dict(id=uuid.uuid4().hex[:12],ok=0,done=start,total=len(links),cancel=False,started=time.time(),updated=0,state='Running',card=card)
     DB.set(uid,'pending_job',dict(links=links,cfg=cfg,start=start,topic_map=topic_map))
@@ -980,7 +982,11 @@ async def command(e,cmd,arg):
         pending = DB.get(uid,'pending_job')
         if not pending:
             raise ValueError('No pending job')
-        return await start_job(e,pending['links'],pending.get('cfg'),pending.get('start',0),pending.get('topic_map'))
+        saved_cfg = dict(pending.get('cfg') or {})
+        for key in ('target','mode','caption'):
+            if key in pending and key not in saved_cfg:
+                saved_cfg[key] = pending[key]
+        return await start_job(e,pending['links'],saved_cfg,pending.get('start',pending.get('idx',0)),pending.get('topic_map'))
     if cmd == 'discard':
         if uid in JOBS:
             raise ValueError('/stop before discarding')
